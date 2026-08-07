@@ -2,6 +2,7 @@
 
 requests
 torch>=2.0.0
+torchao
 transformers
 datasets
 matplotlib
