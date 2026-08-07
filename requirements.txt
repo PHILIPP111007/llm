@@ -3,5 +3,6 @@
 requests
 torch>=2.0.0
 transformers
+datasets
 matplotlib
 tqdm
