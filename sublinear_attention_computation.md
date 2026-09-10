@@ -17,6 +17,13 @@ The algorithm is a routing approximation. It is not claimed to be the same as
 any proprietary or external attention implementation, and it does not by
 itself provide a 10-million-token context window.
 
+The empirical results below come from a separate transparent PyTorch
+Pythia-1B prototype. That prototype is useful for validating the routing idea,
+but it must not be confused with the hierarchical/CUDA implementation
+described in the prefill sections: the Pythia prototype still uses dense
+prefill, batch size 1, a full KV cache, Python-side route construction, and
+`torch.cat` when extending the cache.
+
 ## Configuration
 
 The current GPT-2-style implementation uses:
@@ -410,6 +417,89 @@ implementation uses active-prefix routing and causal masking in the attention
 kernel, but summary construction and route selection should continue to be
 validated carefully for this property.
 
+## Empirical validation on Pythia-1B
+
+The routing variants were evaluated in a manually implemented PyTorch
+Pythia-1B model loaded with the official weights. The evaluation used the same
+Tiny Shakespeare token IDs for every model and an autoregressive KV-cache
+protocol. The model's trained context is 2048 tokens, so the quality benchmark
+uses 2048 input tokens and reports 2047 next-token targets. No 14K perplexity
+claim is made: 14K exceeds Pythia's trained context and is only suitable as a
+separate performance stress test.
+
+### Baseline and first routing variants
+
+| Variant | Mean NLL | Perplexity | Time | Tokens/s | Relative PPL |
+|---|---:|---:|---:|---:|---:|
+| Dense attention | 3.0701 | 21.54 | 26.318 s | 77.78 | 1.00x |
+| Original Ocean, 8 blocks | 3.4758 | 32.33 | 30.171 s | 67.85 | 1.50x |
+| Query-dependent Ocean, 8 blocks | 3.3669 | 28.99 | 56.893 s | 35.98 | 1.35x |
+
+The first Ocean route used one mean summary per 64-token block, local blocks,
+semantic blocks, and an exploration block. It increased PPL by about 50% and
+was slower than dense attention. Replacing the recent-key heuristic with the
+current query improved PPL, but the per-token query-dependent route construction
+made the implementation roughly twice as slow as dense attention.
+
+### Enhanced selector quality frontier
+
+The enhanced selector uses four summary vectors per 64-token block, preserves
+one global first block and two local final blocks, and selects the remaining
+blocks using the current query. Results:
+
+| Block size | Route blocks | Summary parts | Global blocks | Mean NLL | Perplexity | Tokens/s | Speedup vs dense |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 8 | 1 | 0 | 3.3669 | 28.99 | 32.53 | 0.45x |
+| 64 | 8 | 4 | 1 | 3.0851 | 21.87 | 32.75 | 0.45x |
+| 64 | 12 | 4 | 1 | 3.0754 | 21.66 | 32.82 | 0.45x |
+| 64 | 16 | 4 | 1 | 3.0711 | 21.57 | 32.54 | 0.45x |
+| 64 | 24 | 4 | 1 | 3.0700 | 21.54 | 33.03 | 0.46x |
+| 64 | 32 | 4 | 1 | 3.0699 | 21.54 | 33.02 | 0.46x |
+| 32 | 16 | 4 | 1 | 3.0816 | 21.79 | 32.69 | 0.45x |
+
+The quality loss was therefore caused primarily by the coarse one-summary
+representation, not simply by selecting fewer blocks. With four summaries per
+block, 16 selected blocks recover dense quality within the noise of this
+single 2048-token evaluation fragment. At 24 blocks the result is effectively
+identical to dense; 32 blocks is the full-context control because 2048 tokens
+contain 32 blocks of 64 tokens.
+
+The 32-token block experiment did not improve quality at the same approximate
+512-token route budget: `block_size=32, route_blocks=16` produced PPL 21.79,
+versus 21.57 for `block_size=64, route_blocks=16`. This is not evidence that
+smaller blocks are universally worse; it only means that this selector and
+summary construction did not benefit from that change on this test.
+
+### What the speed results actually establish
+
+The enhanced variants all run at approximately 32--33 tokens/s regardless of
+whether they select 8, 12, 16, 24, or 32 blocks. Reducing the route width
+therefore does not yet reduce wall-clock time. The likely fixed costs are:
+
+```text
+full summary rebuild at every refresh
+per-head Python route construction and sorting
+irregular gather operations
+dynamic attention masks
+repeated torch.cat while extending the KV cache
+unfused sparse attention versus dense SDPA kernels
+MLP and projection work that routing does not reduce
+```
+
+The current evidence supports a quality result, not a speed result:
+
+```text
+quality:       substantially improved; route=16 is nearly dense-equivalent
+speed:         not improved; the current sparse implementation is slower
+long context:  requires a separate 14K performance benchmark, not PPL
+```
+
+Before claiming an end-to-end optimization, the implementation must cache and
+incrementally update block summaries, use a preallocated KV cache, eliminate
+Python-side sorting from the hot path, and provide a fused block-sparse
+attention kernel. Only then is it meaningful to repeat the long-context decode
+benchmark.
+
 ## Current limitations
 
 The current implementation has these limitations:
@@ -422,6 +512,8 @@ The current implementation has these limitations:
    sampling.
 6. Sparse attention is an approximation and can lose long-range information.
 7. End-to-end speed is also limited by projections and MLP computation.
+8. In the Pythia prototype, query-dependent routing restores quality but is
+   currently slower than dense attention at the 2048-token context.
 
 ## Future improvements
 
@@ -482,9 +574,10 @@ token budget instead of all previous tokens. Its main remaining bottleneck is
 the global summary scan during route refresh, and its main memory cost is still
 the full linear KV cache.
 
-The current design is best characterized as a practical sublinear-attention
-prototype: it substantially reduces the attention workload, approaches
-constant attention cost per token for a fixed route budget, and now uses an
-incrementally maintained hierarchy so route refresh no longer performs a
-global context scan. The full KV cache remains linear in memory, and the
-hierarchical route is still an approximation whose quality must be measured.
+The design is best characterized as a sublinear-attention research prototype.
+The Pythia experiment demonstrates that a better block representation can
+recover dense-model perplexity with a reduced route, but it does not yet
+demonstrate an end-to-end speedup. The full KV cache remains linear in memory,
+and the hierarchical route described above remains an approximation whose
+quality and implementation speed must be measured separately from the current
+Pythia baseline.
