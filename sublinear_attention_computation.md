@@ -486,26 +486,54 @@ unfused sparse attention versus dense SDPA kernels
 MLP and projection work that routing does not reduce
 ```
 
-The current evidence supports a quality result, not a speed result:
+At the 2048-token trained context, the current evidence supports a quality
+result, not an end-to-end speed result. The incremental route optimization
+changes the conclusion for long-cache decoding, as shown below.
 
 ```text
 quality:       substantially improved; route=16 is nearly dense-equivalent
-speed:         not improved; the current sparse implementation is slower
-long context:  requires a separate 14K performance benchmark, not PPL
+2048 speed:    still slower than dense because the context is short
+14K decode:    faster in decode, but total speedup is limited by dense prefill
+long context:  speed benchmark is valid; perplexity benchmark is not
 ```
 
-Before claiming an end-to-end optimization, the implementation must cache and
-incrementally update block summaries, use a preallocated KV cache, eliminate
-Python-side sorting from the hot path, and provide a fused block-sparse
-attention kernel. Only then is it meaningful to repeat the long-context decode
-benchmark.
+Incremental summary updates and GPU `topk` route selection were then added to
+the Pythia prototype. A separate 14K run measures performance only; it is not a
+quality test because 14K exceeds the model's trained 2048-token context.
+
+### 14K incremental decode performance
+
+The prompt contains 14,000 tokens and generation measures 64 new tokens. The
+prefill remains dense in every variant:
+
+| Variant | Refresh | Prefill s | Decode s | Decode tok/s | Total s | Decode speedup | Total speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Dense | -- | 6.854 | 1.673 | 37.65 | 8.528 | 1.00x | 1.00x |
+| Incremental Ocean | 4 | 6.856 | 1.152 | 54.68 | 8.008 | 1.45x | 1.06x |
+| Incremental Ocean | 16 | 6.870 | 1.018 | 61.88 | 7.888 | 1.64x | 1.08x |
+
+At `refresh_interval=16`, the route is rebuilt 16 times less frequently than
+at `refresh_interval=1`, while the 2048-token quality benchmark remains nearly
+unchanged:
+
+```text
+dense PPL                         = 21.54
+incremental Ocean, refresh=16    = 21.62
+```
+
+The result demonstrates a real long-cache decode speedup, but not a comparable
+end-to-end speedup: dense prefill accounts for approximately 6.9 of the 7.9
+seconds. The remaining performance work is preallocated KV-cache storage,
+fused block-sparse gather/attention, and reducing the cost of score evaluation
+over all visible block summaries.
 
 ## Current limitations
 
 The current implementation has these limitations:
 
 1. The KV cache still grows linearly with context length.
-2. Route refresh scans every visible block summary.
+2. Route refresh still scores all visible block summaries; only summary
+   construction is incremental in the optimized Pythia path.
 3. Prefill repeats route selection for every 50-token chunk.
 4. The route budget is fixed rather than adaptive to query uncertainty.
 5. One deterministic exploration block is not equivalent to true random
@@ -513,7 +541,8 @@ The current implementation has these limitations:
 6. Sparse attention is an approximation and can lose long-range information.
 7. End-to-end speed is also limited by projections and MLP computation.
 8. In the Pythia prototype, query-dependent routing restores quality but is
-   currently slower than dense attention at the 2048-token context.
+   still slower than dense attention at the 2048-token context.
+9. The 14K speedup applies to decode only; prefill remains dense.
 
 ## Future improvements
 
@@ -546,6 +575,10 @@ when one region is clearly dominant.
 Maintain block sums and counts so that appending a token updates a summary in
 `O(D)` instead of recomputing the entire active block.
 
+This optimization is implemented in the incremental Pythia prototype. The
+remaining route cost is scoring visible summaries and selecting them at each
+refresh interval.
+
 ### Paged or quantized KV cache
 
 Use paged storage and FP16, BF16, or quantized K/V values to reduce the linear
@@ -570,14 +603,17 @@ exact causal attention over at most 512 tokens
 ```
 
 Its main computational benefit is that the attention kernel processes a fixed
-token budget instead of all previous tokens. Its main remaining bottleneck is
-the global summary scan during route refresh, and its main memory cost is still
-the full linear KV cache.
+token budget instead of all previous tokens. In the measured Pythia 14K stress
+test, incremental routing reached a 1.64x decode speedup and a 1.08x total
+speedup at `refresh_interval=16`; at the trained 2048-token context it remained
+slower than dense end-to-end. The remaining bottlenecks are the global score
+evaluation during route refresh, KV-cache management, and the lack of a fused
+block-sparse kernel. The full KV cache remains linear in memory.
 
 The design is best characterized as a sublinear-attention research prototype.
-The Pythia experiment demonstrates that a better block representation can
-recover dense-model perplexity with a reduced route, but it does not yet
-demonstrate an end-to-end speedup. The full KV cache remains linear in memory,
-and the hierarchical route described above remains an approximation whose
-quality and implementation speed must be measured separately from the current
-Pythia baseline.
+The Pythia experiment demonstrates both near-dense perplexity with a reduced
+route and a real long-cache decode speedup. It does not provide a comparable
+2048-token end-to-end speedup, nor does it establish valid Pythia quality at
+14K. The full KV cache remains linear in memory, and the hierarchical route
+described above remains an approximation whose quality and implementation speed
+must be measured separately from the current Pythia baseline.
