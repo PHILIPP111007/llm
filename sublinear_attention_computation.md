@@ -1,4 +1,4 @@
-# Sublinear Attention Computation in Ocean
+# Разработка и экспериментальная оценка decoder-only языковой модели для обработки сверхдлинных контекстов на основе sparse attention и INT4 KV-cache
 
 ## Overview
 
