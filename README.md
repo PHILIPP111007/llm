@@ -316,3 +316,123 @@ PyTorch-прототип с полным INT4 KV-cache и ручным hierarchi
 сообщает о совместном long-context обучении и end-to-end линейном SSA pipeline.
 Поэтому для вашей модели доказан bounded attention workload, но не полноценная
 линейная long-context система с гарантированным качеством на 1M токенов.
+
+## Систематическое сравнение с опубликованными архитектурами
+
+Отдельные элементы текущей реализации уже встречаются в научной литературе:
+local/sliding-window attention — в Longformer и BigBird, content-based routing —
+в Routing Transformer, иерархическое внимание — в H-Transformer-1D и Native
+Sparse Attention, а query-dependent выбор страниц или токенов KV — в Quest и
+TokenSelect. Поэтому новизна текущего прототипа должна оцениваться как возможная
+новизна конкретной комбинации, а не как изобретение самого принципа sparse
+attention.
+
+| Архитектура | Основной механизм | Prefill | Decode одного нового токена | Память | Связь с текущей моделью |
+|---|---|---:|---:|---:|---|
+| Dense Transformer | Все query сравниваются со всеми key | `O(N²D)` | `O(ND)` | `O(N)` KV | Базовая Pythia-модель |
+| FlashAttention | Tiled/IO-aware реализация dense attention | `O(N²D)` | `O(ND)` | `O(N)` рабочая память | Ускоряет kernel, но не меняет асимптотику вычислений |
+| Longformer | Local window + глобальные позиции | `O(NWD)` | `O(WD)` | `O(N)` | Аналог local attention без content routing |
+| BigBird | Local + random + global связи | `O(N(W+R+G)D)` | `O((W+R+G)D)` | `O(N)` | Похожая комбинация локальных и дальних блоков |
+| Reformer | LSH-бакетизация похожих токенов | примерно `O(N log N)` | зависит от LSH-реализации | `O(N)` | Субквадратичный поиск, но другой механизм маршрутизации |
+| Routing Transformer | Content-based clustering | примерно `O(N^1.5D)` | sparse attention | `O(N)` | Семантический routing уже исследовался |
+| Performer | Kernel approximation для softmax | `O(NrD)` | `O(rD)` | линейная | Линейная аппроксимация, а не выбор блоков |
+| Linformer | Низкоранговая проекция K/V | `O(NkD)` | `O(kD)` | линейная | Сжимает представление, но не маршрутизирует блоки |
+| H-Transformer-1D | Иерархическое приближение attention | `O(N)` заявлено авторами | зависит от варианта | `O(N)` | Близок по иерархической организации |
+| Quest | Query-aware выбор KV-страниц | зависит от selector | sparse read по top-K страницам | полный `O(N)` KV | Один из наиболее близких методов |
+| TokenSelect | Query-dependent выбор KV-токенов | зависит от selector | sparse read по выбранным токенам | обычно `O(N)` KV | Похожий принцип, но token-level вместо block-level |
+| Native Sparse Attention | Сжатие + fine-grained динамический выбор | sparse/hierarchical | sparse attention | зависит от реализации | Близкая современная trainable-архитектура |
+| SubQ SSA | Content-dependent sparse attention | `O(N)` заявлено | субквадратично по заявлению авторов | `O(N)` заявлено | Наиболее близкий публичный промышленный пример |
+| Текущая модель | Local + semantic blocks + hierarchical routing + INT4 KV | примерно `O(N log N)` в полном текущем path | примерно `O(log N)` на refresh | `O(N)` full INT4 KV | Прозрачный retrofit-прототип Pythia |
+
+Ссылки на основные работы:
+
+- [Longformer](https://arxiv.org/abs/2004.05150) и [BigBird](https://arxiv.org/abs/2007.14062) — фиксированные sparse-паттерны;
+- [Reformer](https://arxiv.org/abs/2001.04451) — LSH attention;
+- [Routing Transformer](https://arxiv.org/abs/2003.05997) — content-based routing;
+- [Performer](https://arxiv.org/abs/2009.14794) и [Linformer](https://arxiv.org/abs/2006.04768) — линейные аппроксимации;
+- [H-Transformer-1D](https://arxiv.org/abs/2107.11906) — hierarchical attention;
+- [Quest](https://arxiv.org/abs/2406.10774) и [TokenSelect](https://arxiv.org/abs/2411.02886) — динамический выбор KV;
+- [Native Sparse Attention](https://arxiv.org/abs/2502.11089) — trainable hierarchical sparse attention;
+- [FlashAttention](https://arxiv.org/abs/2205.14135) — эффективный dense kernel без изменения `O(N²)` compute;
+- [SubQ-1.1-Small Technical Report](https://subq.ai/docs/subq-1-1-small-model-card.pdf) — публичные заявления об SSA.
+
+### Точная интерпретация асимптотики текущей модели
+
+Пусть `B` — размер блока, `K` — число выбранных блоков, `W` — local window,
+`R` — интервал обновления маршрута, а `D` — размерность head.
+
+Само attention-ядро после выбора блоков читает:
+
+```text
+W + K × B
+```
+
+При фиксированных `W`, `K` и `B` это:
+
+```text
+O((W + K × B) × D) = O(1) относительно N
+```
+
+Но это не полная стоимость шага.
+
+При full-scan routing router просматривает все блоки:
+
+```text
+O((N / B) × D)
+```
+
+на одно обновление. При фиксированных `B` и `R` такой decode остаётся `O(N)`
+по зависимости от длины контекста.
+
+При настоящем hierarchical routing без полного просмотра всех summaries поиск
+имеет оценку:
+
+```text
+O(log_B(N / B) × D)
+```
+
+на refresh. Тогда средняя стоимость decode с переиспользованием маршрута:
+
+```text
+O(log(N) / R + W + K × B)
+```
+
+или примерно `O(log N)` при фиксированном `R`. Только при отдельном измерении
+можно утверждать, что текущая реализация действительно выполняет такой обход:
+Python-overhead, полные tensor-операции и memory movement способны скрыть
+теоретический выигрыш.
+
+Полный cache остаётся линейным:
+
+```text
+full INT4 KV-cache = O(N)
+summary tree        = O(N / B) = O(N) при фиксированном B
+```
+
+Следовательно, корректное описание текущего прототипа такое:
+
+```text
+selected attention:       O(1) относительно N
+hierarchical route:       O(log N) на refresh
+full INT4 memory:         O(N)
+full end-to-end prefill:  примерно O(N log N) в текущей реализации
+```
+
+Это субквадратичная архитектура, но не `O(1)`-модель целиком и не модель с
+сублинейной памятью.
+
+### Оценка потенциальной новизны
+
+| Компонент | Статус по литературе |
+|---|---|
+| Local/sliding-window attention | Известный подход |
+| Random/global блоки | Известный подход BigBird и родственных моделей |
+| Content-dependent выбор блоков | Известный класс Routing Transformer, Quest, TokenSelect и NSA |
+| Иерархические summaries | Известный класс hierarchical attention и индексов |
+| Sparse read поверх полного KV-cache | Близко к Quest и TokenSelect |
+| INT4 KV-cache | Известное инженерное направление |
+| Полная комбинация INT4 + local + hierarchical block routing + exact selected attention | Может быть инженерно новой комбинацией, но требует отдельного сравнения |
+
+Таким образом, текущая работа убедительнее всего формулируется как прозрачный
+proof-of-concept конкретной системы маршрутизации и хранения KV, а не как уже
+доказанное новое фундаментальное attention-открытие.
