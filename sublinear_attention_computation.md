@@ -845,3 +845,109 @@ route and a real long-cache decode speedup. It does not provide a comparable
 14K. The full KV cache remains linear in memory, and the hierarchical route
 described above remains an approximation whose quality and implementation speed
 must be measured separately from the current Pythia baseline.
+
+## Final experiment status: INT4 KV-cache and ultra-long context
+
+The experiment is now frozen. The final result is an engineering and
+complexity result, not a claim that the unmodified Pythia-1B model is a
+reliable million-token language model.
+
+### What was achieved
+
+The Pythia prototype contains a packed INT4 KV-cache with per-token scales for
+both keys and values. The exact cache memory estimates were:
+
+| Context | FP16 full KV-cache | INT4 full KV-cache |
+|---:|---:|---:|
+| 32,768 | 4.00 GiB | 1.02 GiB |
+| 131,072 | 16.00 GiB | 4.06 GiB |
+| 1,000,000 | 122.07 GiB | 30.99 GiB |
+
+These numbers are estimates for the complete Pythia-1B KV-cache, including
+the INT4 scale storage used by the prototype. They exclude model weights,
+temporary attention buffers, allocator fragmentation, and operating-system
+overhead. Consequently, a complete INT4 cache at one million tokens is close
+to the capacity of a 32 GiB V100 and is not a practical guarantee of successful
+execution on that GPU.
+
+A separate bounded local-plus-segment cache did complete a speed-only 1M-token
+prefill experiment:
+
+```text
+prompt length       = 1,000,000 tokens
+prefill             = 274.35 s
+prefill throughput   = 3,645 tokens/s
+decode throughput    = 54.02 tokens/s
+peak allocated       = 7.71 GiB
+```
+
+That result demonstrates that a bounded-memory inference path can process a
+million-token input in this prototype. It does not demonstrate million-token
+retrieval quality. The bounded cache and the INT4 routed cache are different
+implementations and must not be conflated.
+
+### What the asymptotic result means
+
+With a fixed local window and a fixed number of selected blocks, the exact
+attention kernel sees a bounded number of tokens per decoded query:
+
+```text
+selected attention = O(K * D), where K is independent of N
+```
+
+The hierarchical router adds approximately:
+
+```text
+route refresh = O(beam * log(N / block_size) * D)
+```
+
+Thus the context-dependent attention and routing work is sublinear in the
+active context length for the implemented sparse decode path. The complete
+model is not universally `O(1)`: projections and MLP layers remain per-token,
+prefill must process every prompt token, and a retained full KV-cache still
+requires `O(N)` memory. INT4 changes the memory constant, not the asymptotic
+memory class.
+
+### Quality boundary
+
+The native-context control was successful:
+
+```text
+full INT4 cache, context = 2,048
+perplexity              = 3.96
+text exact match        = True
+```
+
+At 32K, the full INT4 control also failed to retrieve the synthetic needle,
+with perplexity approximately 18,757. The routed and oracle experiments were
+also poor and produced CUDA memory-pressure warnings. This does not establish
+that INT4 is the cause. The checkpoint was trained for a 2,048-token context,
+and the 32K test relies on untrained RoPE extrapolation. The later RoPE-scaling
+experiment was not accepted as evidence of a successful 32K model because it
+was initially run with a contaminated 14K configuration and did not include
+long-context fine-tuning.
+
+Therefore the final quality conclusion is:
+
+```text
+INT4 preserves useful quality at the native Pythia context.
+The prototype does not establish reliable quality at 14K, 32K, or 1M tokens.
+```
+
+### Stopping point
+
+The experiment is stopped at this point. The defensible contribution is an
+inspectable PyTorch prototype combining:
+
+1. exact packed INT4 K/V storage;
+2. local/sliding-window attention;
+3. content-dependent block routing;
+4. hierarchical route indexing;
+5. bounded selected-attention work for decoding;
+6. a demonstrated million-token speed-only bounded-cache run.
+
+The remaining unresolved requirement is long-context training. To claim useful
+quality beyond 2,048 tokens, the model would need long-context RoPE adaptation
+and continued training on long sequences, followed by position-controlled
+perplexity and retrieval evaluation. That work is outside the scope of the
+current experiment.
