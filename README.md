@@ -1,4 +1,4 @@
-# Pythia-1B: полный INT4 KV-cache и hierarchical routing
+# Разработка и экспериментальная оценка decoder-only языковой модели для обработки сверхдлинных контекстов на основе sparse attention и INT4 KV-cache
 
 Экспериментальная реализация Pythia-1B на чистом PyTorch находится в
 [`Pythia_1B.ipynb`](./Pythia_1B.ipynb). Используются официальные веса Pythia-1B,
