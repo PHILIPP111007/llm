@@ -179,6 +179,155 @@ Causal masking is still applied. A selected block can be partially visible for
 a query near the beginning of that block; future tokens are not included in the
 attention result.
 
+## Hybrid local attention plus Ocean routing
+
+The next proposed variant combines a strict sliding-window component with the
+existing Ocean route. This is a proposed extension, not the configuration used
+for the Pythia measurements above.
+
+For every query, the candidate keys are formed as the union of four sets:
+
+```text
+local window       = the latest W tokens
+semantic blocks    = S blocks selected by Ocean routing
+global blocks      = G mandatory blocks, for example the first block
+exploration blocks = optional additional blocks
+```
+
+Duplicate tokens are removed before attention. The attention kernel then runs
+exact causal softmax only over this union:
+
+```text
+K_candidate, V_candidate = unique(local_window
+                                  ∪ semantic_blocks
+                                  ∪ global_blocks
+                                  ∪ exploration_blocks)
+output = causal_attention(Q, K_candidate, V_candidate)
+```
+
+The local window is different from the current `local_blocks` parameter. The
+current parameter forces the latest blocks into the route, but it still allows
+the full KV cache to remain addressable. A strict window of `W` tokens gives a
+hard bound on the recent-token part of the attention operation. Old tokens are
+still retained in the KV cache unless an eviction or compression policy is
+added.
+
+A reasonable first configuration for an experiment is:
+
+```text
+window size W       = 256 tokens
+block size B        = 256 tokens
+semantic blocks S   = 8
+global blocks G     = 1
+refresh interval R  = 16 tokens
+```
+
+The maximum exact-attention candidate set is then approximately:
+
+```text
+K <= W + (S + G) * B
+  = 256 + (8 + 1) * 256
+  = 2560 tokens
+```
+
+The actual number can be smaller because the local window overlaps the latest
+selected block and duplicate blocks are removed. A smaller route, such as
+`S=4`, should be evaluated separately because increasing the route budget can
+erase the intended speed benefit.
+
+This hybrid design gives the model guaranteed access to recent syntax and
+short-range dependencies while Ocean routing supplies a bounded number of
+older, semantically relevant regions. It is not equivalent to dense attention:
+any old token outside the window and selected blocks is invisible to the
+current query. The quality claim therefore requires perplexity and long-range
+retrieval ablations against both dense attention and pure sliding-window
+attention.
+
+### Asymptotic estimate for the hybrid variant
+
+Let `N` be the active context length, `D` the head dimension, `B` the block
+size, `W` the local-window size, `S` the number of semantic blocks, `G` the
+number of global blocks, and `K` the number of unique candidate tokens:
+
+```text
+K <= W + (S + G) * B
+```
+
+For one decoded token, the exact attention computation is:
+
+```text
+O(K * D)
+```
+
+If `W`, `B`, `S`, and `G` are constants independent of `N`, this is
+`O(D)` with respect to context length. In other words, the attention kernel is
+constant-time in `N` for decoding, which is stronger than merely linear in
+`N`. This statement applies only to the selected-attention kernel, not to the
+whole Transformer block.
+
+The route refresh adds a separate cost. With a full scan of block summaries,
+one refresh costs approximately:
+
+```text
+O((W + N/B) * D)
+```
+
+Amortized over `R` decoded tokens, this becomes:
+
+```text
+O(((W + N/B) * D) / R)
+```
+
+Therefore a naive implementation is not truly `O(1)` in total decode cost as
+`N` grows: the attention kernel is bounded, but route construction can grow
+with the number of blocks. A persistent hierarchical index changes the refresh
+term to approximately:
+
+```text
+O((W + beam * log(N/B)) * D)
+```
+
+and incremental summary updates add `O(D)` per appended token. The resulting
+per-token decode estimate is:
+
+```text
+O(D^2)                                   projections and MLP
++ O(K * D)                                local + routed attention
++ O(((W + beam*log(N/B)) * D) / R)         amortized route refresh
+```
+
+For fixed model width, route budget, beam, and refresh interval, the attention
+term is independent of `N`, while the indexed routing term grows only
+logarithmically. The end-to-end model is therefore approximately
+`O(log N)` in its context-dependent routing component, not automatically
+`O(1)` overall.
+
+For prefill, every prompt token or query chunk still has to be processed. With
+fixed `K` and a hierarchical selector, the idealized attention and routing
+work is approximately:
+
+```text
+O(N * K * D) + O((N/C) * beam * log(N/B) * D)
+```
+
+for chunk size `C`, in addition to the model's linear per-token projections
+and MLP work. This is approximately linear in `N` for fixed parameters, but
+Python route construction, gathers, kernel launches, and unfused sparse
+kernels can dominate wall-clock time. A measured flat prefill throughput is
+not by itself proof of sublinear asymptotic behavior.
+
+Memory has a separate bound. If the complete KV cache is retained, memory is
+still:
+
+```text
+O(L * N * D)
+```
+
+The sliding window limits the attention candidates, not the stored history. To
+obtain `O(W + (S+G)B)` active memory, old KV entries must be evicted or replaced
+by compressed summaries; that change can reduce quality and is a separate
+algorithmic decision.
+
 ## Prefill behavior
 
 During long-prompt prefill, the input is processed in query chunks of 50
@@ -526,6 +675,66 @@ end-to-end speedup: dense prefill accounts for approximately 6.9 of the 7.9
 seconds. The remaining performance work is preallocated KV-cache storage,
 fused block-sparse gather/attention, and reducing the cost of score evaluation
 over all visible block summaries.
+
+### Required routing ablation: full scan versus hierarchy
+
+The hierarchical selector must be compared directly with a full-scan selector
+before claiming that the asymptotic improvement is useful in practice. Both
+variants must use the same model weights, tokenizer, numerical dtype, block
+size, route width, local/global blocks, refresh interval, prompt fragments,
+random seeds, and warm-up protocol. Only the route-construction algorithm may
+change.
+
+The comparison must report three separate dimensions:
+
+```text
+quality:
+    mean NLL and perplexity on the same held-out token stream
+
+performance:
+    route-refresh time, prefill tok/s, decode tok/s, end-to-end latency,
+    and peak GPU memory at several context lengths
+
+long-range retrieval:
+    exact retrieval accuracy for information placed outside the local window,
+    selected-block recall against full-scan top-k blocks, and generated-answer
+    accuracy on synthetic distance-controlled prompts
+```
+
+The minimum context sweep should include `N=2048`, `4096`, `8192`, and
+`14000` tokens where the implementation supports them. The 14K Pythia result
+must remain a speed/stress measurement rather than a trained-context
+perplexity claim. For quality, use contexts within the model's validated
+training limit or a separately trained long-context model.
+
+The most important routing-specific metric is selected-block recall:
+
+```text
+recall = |hierarchical_route ∩ full_scan_route| / |full_scan_route|
+```
+
+This should be measured at the leaf-block level and separately for local,
+global, and semantic blocks. Perplexity alone can hide a routing failure if
+the model compensates using local or global blocks. Conversely, equal PPL at a
+short context is weak evidence when the route covers most of the available
+sequence.
+
+The expected hypotheses are:
+
+```text
+full scan:
+    better or equal route recall, but refresh cost grows as O(N/B)
+
+hierarchical routing:
+    lower refresh cost, approximately O(beam * log(N/B)), with possible
+    quality loss from approximate pruning
+```
+
+No claim that hierarchical routing is superior should be made unless it keeps
+perplexity and long-range retrieval within a predefined tolerance while
+reducing measured routing or end-to-end latency. A speedup in the final model
+is not sufficient if the hierarchy merely shifts the cost into summary
+construction, gathers, or Python-side bookkeeping.
 
 ## Current limitations
 
