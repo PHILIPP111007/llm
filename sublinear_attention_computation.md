@@ -736,6 +736,25 @@ reducing measured routing or end-to-end latency. A speedup in the final model
 is not sufficient if the hierarchy merely shifts the cost into summary
 construction, gathers, or Python-side bookkeeping.
 
+### Implemented model pair in `Pythia_1B.ipynb`
+
+The notebook now contains two models built from the same Pythia-1B weights:
+
+```text
+HybridSlidingWindowPythiaForCausalLM(routing='full_scan')
+HybridSlidingWindowPythiaForCausalLM(routing='hierarchical')
+```
+
+Both models use the same preallocated KV-cache, incremental multi-summary
+updates, strict local window, global blocks, route refresh interval, and exact
+causal attention over the resulting candidates. The full-scan model scores all
+eligible leaf summaries. The hierarchical model uses the persistent summary
+tree and beam search. The notebook includes common perplexity and generation
+benchmarks plus optional hierarchical selected-block recall against the
+full-scan route. The comparison is disabled by default to avoid accidentally
+allocating two additional 1B-parameter models; no new benchmark numbers are
+claimed until that controlled comparison is executed.
+
 ## Current limitations
 
 The current implementation has these limitations:
