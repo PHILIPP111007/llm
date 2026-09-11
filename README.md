@@ -186,3 +186,55 @@ continued pretraining/fine-tuning на длинных последователь
 
 Он не демонстрирует гарантированное качество Pythia-1B на 14K, 32K или 1M
 токенах и не должен описываться как законченная long-context модель.
+
+## Сравнение асимптотики с SubQ
+
+Терминологически `O(N)` — линейная, а не сублинейная асимптотика. Она является
+субквадратичной относительно обычного dense attention `O(N²)`.
+
+| Операция | Dense GPT | Текущая Pythia full INT4 + routing | SubQ по публичному описанию |
+|---|---:|---:|---:|
+| Полный KV-cache | `O(N)` | `O(N)` | Заявлено `O(N)` |
+| INT4 KV-cache | `O(N)` с меньшей константой | `O(N)` с меньшей константой | Детали не раскрыты |
+| Attention одного decode-токена | `O(N)` | `O(K)`, где `K` фиксирован | Заявлена линейная SSA-архитектура |
+| Routing одного decode-токена | — | примерно `O(log N)` | Заявлена линейная end-to-end селекция |
+| Prefill attention | `O(N²)` | примерно `O(N log N)` в текущем hierarchical path | Заявлено `O(N)` |
+| Полная обработка контекста | примерно `O(N²)` | примерно `O(N log N)` сейчас | Заявлено `O(N)` |
+
+Для текущей модели:
+
+```text
+K = route_blocks × block_size + local_window
+```
+
+При фиксированных параметрах `K` не зависит от длины контекста. Поэтому
+выбранный attention одного decode-токена имеет стоимость:
+
+```text
+O(K · D) = O(1) относительно N
+```
+
+Однако hierarchical router всё равно ищет блоки в summary-дереве:
+
+```text
+O(beam_width · log(N / block_size) · D)
+```
+
+Поэтому полный context-dependent decode-шаг имеет оценку `O(log N) + O(1)`,
+а не строго `O(1)`. В текущем prefill дополнительно выполняются обработка всех
+токенов, построение summaries и routing для chunks, поэтому практическая оценка
+составляет примерно `O(N log N)`. Полностью fused selector может приблизить её
+к `O(N)`.
+
+Публичный технический отчёт SubQ заявляет, что SSA выполняет selection,
+retrieval и sparse attention с линейным масштабированием по длине контекста.
+Внутренние детали SSA и точные константы не раскрыты:
+
+- [SubQ: Introducing SubQ](https://subq.ai/introducing-subq)
+- [SubQ-1.1-Small Technical Report](https://subq.ai/docs/subq-1-1-small-model-card.pdf)
+
+Главное различие состоит не только в routing. Ваша реализация — прозрачный
+PyTorch-прототип с полным INT4 KV-cache и ручным hierarchical selector. SubQ
+сообщает о совместном long-context обучении и end-to-end линейном SSA pipeline.
+Поэтому для вашей модели доказан bounded attention workload, но не полноценная
+линейная long-context система с гарантированным качеством на 1M токенов.
