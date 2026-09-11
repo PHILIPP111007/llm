@@ -94,12 +94,18 @@ summary tree -> hierarchical route -> selected block IDs
                          dequantized exact K/V -> attention
 ```
 
-При фиксированных `route_blocks`, `block_size` и `local_window` выбранный
-attention имеет ограниченную зависимость от длины истории:
+При фиксированных `route_blocks`, `block_size` и `local_window` сам attention
+по уже выбранным K/V имеет постоянный размер относительно длины истории:
 
 ```text
-selected attention = O(K · D),  K = O(1) относительно N
+W = local_window
+K = route_blocks × block_size
+selected attention = O((W + K) · D) = O(1) относительно N
 ```
+
+В текущем конфиге это максимум примерно `256 + 16 × 256 = 4352` candidate-
+токена на decode-шаг. Полный KV-cache при этом не сокращается: routing только
+решает, какие блоки читать.
 
 Иерархический refresh маршрута оценивается как:
 
@@ -107,9 +113,17 @@ selected attention = O(K · D),  K = O(1) относительно N
 O(beam_width · log(N / block_size) · D)
 ```
 
-Это не делает всю модель `O(1)`: prefill обрабатывает каждый входной токен,
-проекции и MLP выполняются для каждого токена, а полный KV-cache остаётся
-линейным по памяти.
+Следовательно, context-dependent часть одного decode-шагa имеет оценку:
+
+```text
+decode = O(1) selected attention + O(log N) hierarchical routing
+       = O(log N) на refresh
+```
+
+Между refresh-операциями маршрут переиспользуется, и attention-часть шага
+остаётся `O(1)` относительно `N`. Это не делает всю модель `O(1)`: prefill
+обрабатывает каждый входной токен, проекции и MLP выполняются для каждого
+токена, а полный KV-cache остаётся линейным по памяти.
 
 ## Память полного cache
 
@@ -259,22 +273,23 @@ continued pretraining/fine-tuning на длинных последователь
 |---|---:|---:|---:|
 | Полный KV-cache | `O(N)` | `O(N)` | Заявлено `O(N)` |
 | INT4 KV-cache | `O(N)` с меньшей константой | `O(N)` с меньшей константой | Детали не раскрыты |
-| Attention одного decode-токена | `O(N)` | `O(K)`, где `K` фиксирован | Заявлена линейная SSA-архитектура |
-| Routing одного decode-токена | — | примерно `O(log N)` | Заявлена линейная end-to-end селекция |
-| Prefill attention | `O(N²)` | примерно `O(N log N)` в текущем hierarchical path | Заявлено `O(N)` |
+| Выбранный attention одного decode-токена | `O(N)` | `O((W + K) · D) = O(1)` относительно `N` | Заявлена линейная SSA-архитектура |
+| Hierarchical routing одного decode-токена | — | `O(log N)` на refresh, между refresh — переиспользование route | Заявлена линейная end-to-end селекция |
+| Prefill attention | `O(N²)` | примерно `O(N)` при фиксированном chunk; полный текущий path зависит от routing/index maintenance | Заявлено `O(N)` |
 | Полная обработка контекста | примерно `O(N²)` | примерно `O(N log N)` сейчас | Заявлено `O(N)` |
 
 Для текущей модели:
 
 ```text
-K = route_blocks × block_size + local_window
+W = local_window
+K = route_blocks × block_size
 ```
 
-При фиксированных параметрах `K` не зависит от длины контекста. Поэтому
+При фиксированных параметрах `W` и `K` не зависят от длины контекста. Поэтому
 выбранный attention одного decode-токена имеет стоимость:
 
 ```text
-O(K · D) = O(1) относительно N
+O((W + K) · D) = O(1) относительно N
 ```
 
 Однако hierarchical router всё равно ищет блоки в summary-дереве:
@@ -284,10 +299,11 @@ O(beam_width · log(N / block_size) · D)
 ```
 
 Поэтому полный context-dependent decode-шаг имеет оценку `O(log N) + O(1)`,
-а не строго `O(1)`. В текущем prefill дополнительно выполняются обработка всех
-токенов, построение summaries и routing для chunks, поэтому практическая оценка
-составляет примерно `O(N log N)`. Полностью fused selector может приблизить её
-к `O(N)`.
+то есть примерно `O(log N)` на обновлении маршрута, а не строго `O(1)`. В
+текущем prefill attention-вычисления для фиксированного chunk масштабируются
+примерно линейно по числу входных токенов; дополнительные summaries и routing
+могут добавить логарифмический множитель. Это описание сложности именно
+компонентов, а не утверждение, что вся модель работает за `O(1)`.
 
 Публичный технический отчёт SubQ заявляет, что SSA выполняет selection,
 retrieval и sparse attention с линейным масштабированием по длине контекста.
