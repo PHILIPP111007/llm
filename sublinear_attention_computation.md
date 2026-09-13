@@ -953,3 +953,126 @@ quality beyond 2,048 tokens, the model would need long-context RoPE adaptation
 and continued training on long sequences, followed by position-controlled
 perplexity and retrieval evaluation. That work is outside the scope of the
 current experiment.
+
+## Routing ablation: cosine selection versus neural reranking
+
+The routing ablation was run on the same manually implemented Pythia-1B model
+and the same Tiny Shakespeare token stream. Quality was evaluated only at the
+native 2,048-token context. Longer contexts were used only for speed, because
+the original Pythia checkpoint was not trained for those positions.
+
+The production routing configuration was:
+
+```text
+block size              = 256 tokens
+route blocks            = 16
+beam width              = 32
+summary parts           = 4
+global blocks           = 1
+local blocks            = 2
+local window            = 256 tokens
+route refresh interval  = 64 tokens
+```
+
+The recall diagnostic used a smaller block size of 16 tokens. This was
+intentional: at 2,048 tokens, 256-token blocks produce only eight blocks, so
+Recall@64 would be degenerate. The oracle was the Top-16 blocks by dense
+attention mass.
+
+### Quality at the native context
+
+| Routing variant | Mean NLL | Perplexity | PPL delta vs dense | Relative PPL delta |
+|---|---:|---:|---:|---:|
+| Dense | 3.0693 | 21.5260 | 0.0000 | 0.00% |
+| Full-scan cosine | 3.0781 | 21.7160 | +0.1901 | +0.88% |
+| Hierarchical cosine | 3.0781 | 21.7160 | +0.1901 | +0.88% |
+| Full-scan + neural reranker | 3.0781 | 21.7170 | +0.1910 | +0.89% |
+| Hierarchical + neural reranker | 3.0781 | 21.7170 | +0.1910 | +0.89% |
+| Neural selector, full scan without cosine filter | 3.0781 | 21.7170 | +0.1910 | +0.89% |
+
+At 2,048 tokens, the routed variants remain close to dense quality. However,
+the result does not demonstrate a speed advantage: the context is short and
+the routed implementation pays for route construction and irregular memory
+accesses.
+
+### Selected-block recall
+
+| Selector | Recall |
+|---|---:|
+| Cosine Top-64 | 99.54% |
+| Hierarchical cosine Top-64 | 99.54% |
+| Cosine-only Top-16 | 86.82% |
+| Cosine Top-64 followed by neural reranker Top-16 | 67.24% |
+| Neural selector over all blocks Top-16 | 66.06% |
+| Hierarchical Top-64 followed by neural reranker Top-16 | 67.24% |
+
+The reranker is not successful in its current form. It reduces Recall@16 from
+86.82% for cosine-only selection to 67.24%. Its mean measured latency in the
+diagnostic was 0.488 ms per attention head. Therefore the current evidence
+does not support using the neural reranker as a quality improvement. It is a
+failed or insufficiently trained selector until a new training protocol
+improves its recall on held-out sequences.
+
+### Speed across context lengths
+
+The benchmark generated 16 tokens after prefill. The dense baseline was
+measured only at 2,048 tokens; the routed variants were also measured at
+14,000, 32,768, and 100,000 tokens.
+
+| Routing | Context | Prefill tok/s | Decode tok/s | Total time |
+|---|---:|---:|---:|---:|
+| Dense | 2,048 | 23,678 | 87.34 | 0.270 s |
+| Full-scan cosine | 2,048 | 6,029 | 29.50 | 0.882 s |
+| Full-scan cosine | 14,000 | 4,365 | 23.65 | 3.884 s |
+| Full-scan cosine | 32,768 | 4,169 | 23.24 | 8.548 s |
+| Full-scan cosine | 100,000 | 4,033 | 23.76 | 25.468 s |
+| Hierarchical cosine | 2,048 | 4,924 | 28.78 | 0.972 s |
+| Hierarchical cosine | 14,000 | 2,846 | 23.13 | 5.612 s |
+| Hierarchical cosine | 32,768 | 2,439 | 21.47 | 14.182 s |
+| Hierarchical cosine | 100,000 | 2,238 | 23.54 | 45.354 s |
+| Full-scan + reranker | 2,048 | 5,875 | 29.39 | 0.893 s |
+| Full-scan + reranker | 14,000 | 3,959 | 23.62 | 4.214 s |
+| Full-scan + reranker | 32,768 | 3,750 | 22.99 | 9.433 s |
+| Full-scan + reranker | 100,000 | 3,231 | 20.03 | 31.748 s |
+| Hierarchical + reranker | 2,048 | 4,287 | 21.04 | 1.238 s |
+| Hierarchical + reranker | 14,000 | 2,077 | 20.98 | 7.504 s |
+| Hierarchical + reranker | 32,768 | 2,236 | 21.29 | 15.404 s |
+| Hierarchical + reranker | 100,000 | 2,096 | 22.33 | 48.416 s |
+| Neural selector, full scan | 2,048 | 5,764 | 29.33 | 0.901 s |
+| Neural selector, full scan | 14,000 | 4,197 | 23.54 | 4.015 s |
+| Neural selector, full scan | 32,768 | 4,006 | 23.04 | 8.874 s |
+| Neural selector, full scan | 100,000 | 3,915 | 23.30 | 26.228 s |
+
+At 2,048 tokens, dense decoding is approximately three times faster than the
+routed variants. Hierarchical routing is slower than full-scan routing at all
+long contexts in this implementation, despite its better theoretical route
+complexity. The likely cause is Python-side tree traversal, repeated small GPU
+operations, and synchronization overhead.
+
+The JSON field named `decode_speedup_vs_dense` should be interpreted carefully:
+it was calculated as `dense_decode_tok/s / routed_decode_tok/s`, so a value
+greater than one means that dense is faster, not that routing provides a
+speedup. Likewise, `total_speedup_vs_dense` is below one for every routed
+variant at 2,048 tokens, confirming that routed end-to-end latency is worse.
+
+### Needle retrieval
+
+The 2,048-token synthetic needle test did not produce an exact text match for
+any variant. Dense and routed models predicted the partial string
+`"\\nBIT-314159"` instead of the target `" ORBIT-314159"`. The result is
+therefore insufficient to claim exact long-range retrieval, even though the
+prediction contains part of the needle. This test should be repeated with
+leading-space normalization and multiple needle positions before drawing a
+strong conclusion.
+
+### Interim conclusion
+
+This ablation establishes that cosine block routing can preserve near-dense
+PPL at 2,048 tokens while selecting a small candidate set in the diagnostic.
+It does not establish that the current neural reranker improves routing: its
+Recall@16 is substantially worse than cosine-only selection. Nor does it
+establish practical speed superiority: the current hierarchical implementation
+is slower than full scan, and both are slower than dense at the native context.
+The next meaningful experiment is reranker retraining against held-out dense
+attention-mass targets, followed by a repeated recall/quality/latency ablation
+with identical warm-up and synchronization conditions.

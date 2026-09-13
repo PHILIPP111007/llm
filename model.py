@@ -361,6 +361,7 @@ class INT4RoutedKVCache(INT4FullKVCache):
             device=self.device,
             dtype=torch.float16,
         )
+        self.value_tree_sums = torch.zeros_like(self.tree_sums)
         self.tree_counts = torch.zeros(
             node_count,
             self.summary_parts,
@@ -374,6 +375,7 @@ class INT4RoutedKVCache(INT4FullKVCache):
             device=self.device,
             dtype=torch.float32,
         )
+        self.current_value_sums = torch.zeros_like(self.current_sums)
         self.current_counts = torch.zeros(
             self.summary_parts,
             device=self.device,
@@ -391,14 +393,17 @@ class INT4RoutedKVCache(INT4FullKVCache):
         if self.current_count == 0:
             return
         block_sums = self.current_sums.to(self.tree_sums.dtype)
+        value_block_sums = self.current_value_sums.to(self.value_tree_sums.dtype)
         node = self.leaf_start + self.current_block_id
         while True:
             self.tree_sums[:, node, :, :].add_(block_sums)
+            self.value_tree_sums[:, node, :, :].add_(value_block_sums)
             self.tree_counts[node, :].add_(self.current_counts)
             if node == 0:
                 break
             node = (node - 1) // 2
         self.current_sums.zero_()
+        self.current_value_sums.zero_()
         self.current_counts.zero_()
         self.current_count = 0
 
@@ -421,6 +426,9 @@ class INT4RoutedKVCache(INT4FullKVCache):
             )
             self.current_sums[:, part, :].add_(
                 key[0, :, offset : offset + take, :].float().sum(dim=1)
+            )
+            self.current_value_sums[:, part, :].add_(
+                value[0, :, offset : offset + take, :].float().sum(dim=1)
             )
             self.current_counts[part] += take
             self.current_count += take
