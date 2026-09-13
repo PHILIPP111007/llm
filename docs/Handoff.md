@@ -325,6 +325,111 @@ irregular gathers, small GPU kernels и отсутствия fused block-sparse 
 Это не опровержение асимптотики дерева; это демонстрация слишком большого
 constant factor текущей Python/GPU реализации hierarchy.
 
+### v4 chunk-union: long-context speed and Recall
+
+После обучения `block-reranker-v4-chunk-union.pt` выполнен benchmark на
+контекстах 16K и 32K. При production `block_size=256` это соответственно 64 и
+128 доступных блоков, поэтому speed-тест уже не вырождается в случай 8 блоков.
+
+| Context | Routing | Prefill tok/s | Decode tok/s | Total s | Routing s |
+|---:|---|---:|---:|---:|---:|
+| 16,384 | Full-scan cosine | 3,810 | 22.26 | 5.019 | 0.664 |
+| 16,384 | Full-scan v4 reranker | 3,409 | 22.30 | 5.524 | 1.319 |
+| 16,384 | Hierarchical cosine | 2,616 | 21.30 | 7.014 | 2.874 |
+| 16,384 | Hierarchical v4 reranker | 2,348 | 21.46 | 7.722 | 3.597 |
+| 32,768 | Full-scan cosine | 4,030 | 22.96 | 8.828 | 1.059 |
+| 32,768 | Full-scan v4 reranker | 3,384 | 22.51 | 10.393 | 2.609 |
+| 32,768 | Hierarchical cosine | 2,388 | 21.67 | 14.458 | 6.647 |
+| 32,768 | Hierarchical v4 reranker | 2,151 | 21.32 | 15.985 | 8.167 |
+
+В сравнении с full-scan cosine v4 увеличил total latency на 10.1% при 16K и
+на 17.7% при 32K. Hierarchical routing в текущей Python-реализации оказался
+медленнее full-scan на 39.7–63.8%, а hierarchical v4 — на 53.9–81.1%.
+
+Recall diagnostic дал следующий результат:
+
+| Metric | v4 result |
+|---|---:|
+| Cosine Recall@64 | 93.75% |
+| Hierarchical Recall@64 | 93.75% |
+| Cosine-only Recall@16 | 51.74% |
+| Cosine Top-64 → v4 Top-16 | 35.62% |
+| Neural full-scan v4 Top-16 | 33.88% |
+| Hierarchical Top-64 → v4 Top-16 | 35.62% |
+| Mean reranker latency | 0.769 ms/head |
+
+Итог отрицательный: v4 не улучшил cosine-only routing и снизил Recall@16 с
+51.74% до 35.62%. Однако Recall diagnostic использовал `block_size=16`, тогда
+как v4 обучался на `block_size=256`; это out-of-distribution проверка и не
+является окончательным production-выводом. Тем не менее reranker также не дал
+улучшения на PPL 2048 и добавил latency, поэтому текущий production baseline —
+full-scan cosine без neural reranking.
+
+### Следующий эксперимент: v5 с block_size=16
+
+Для проверки гипотезы о более мелких semantic blocks benchmark теперь позволяет
+переопределять `teacher_block_size`, `teacher_summary_parts`,
+`routing_block_size` и `routing_summary_parts`. v5 должен обучаться и
+тестироваться с одной и той же конфигурацией; v4 и v5 нельзя сравнивать как
+один и тот же reranker.
+
+Обучение v5:
+
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
+      --mode train-reranker \
+      --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+      --text-file ./tinyshakespeare.txt \
+      --reranker-output ./checkpoints/block-reranker-v5-b16.pt \
+      --reranker-steps 1500 \
+      --reranker-sequences 32 \
+      --reranker-query-stride 64 \
+      --teacher-mode chunk_union \
+      --teacher-block-size 16 \
+      --teacher-summary-parts 2 \
+      --teacher-chunk-size 256 \
+      --teacher-local-window 256
+
+PPL на native context:
+
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
+      --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+      --text-file ./tinyshakespeare.txt \
+      --reranker-checkpoint ./checkpoints/block-reranker-v5-b16.pt \
+      --routing-block-size 16 \
+      --routing-summary-parts 2 \
+      --contexts 2048 \
+      --output ./routing_ablation_v5_b16_2048.json
+
+Long-context speed:
+
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
+      --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+      --text-file ./tinyshakespeare.txt \
+      --reranker-checkpoint ./checkpoints/block-reranker-v5-b16.pt \
+      --routing-block-size 16 \
+      --routing-summary-parts 2 \
+      --contexts 2048,16384,32768 \
+      --skip-ppl \
+      --skip-needle \
+      --output ./routing_ablation_v5_b16_speed.json
+
+Успех v5 означает: Recall@16 выше cosine-only, PPL не хуже dense на 2048 и
+приемлемая route latency. Даже успешный v5 не уменьшит O(N) память полного
+INT4 KV-cache; он только уменьшит гранулярность и потенциальный selected
+attention workload.
+
+v5 обучен:
+
+    steps: 1500
+    teacher samples: 3584
+    final total loss: 2.2496
+    final listwise loss: 2.2441
+    final ranking loss: 0.0220
+
+Loss v5 нельзя напрямую сравнивать с v4: при `block_size=16` в контексте 2048
+доступно 128 блоков против примерно 8 блоков при `block_size=256`, поэтому
+listwise classification существенно сложнее.
+
 ### Needle retrieval
 
 На 2048 synthetic needle benchmark ни один вариант не дал exact text match.
@@ -385,6 +490,172 @@ checkpoint’ами.
 v3 технически работает внутри routed attention, но пока не дал научно
 положительного результата: PPL немного хуже v2, а Recall практически такой же.
 
+### Полный эксперимент с neural reranking
+
+Neural reranking был добавлен как второй этап маршрутизации:
+
+    1. cosine или hierarchical selector выбирает candidate blocks;
+    2. небольшой neural reranker пересчитывает score только этих кандидатов;
+    3. выбираются финальные semantic blocks;
+    4. mandatory global/local blocks добавляются отдельно.
+
+Reranker не является второй языковой моделью и не изменяет веса Pythia. Он
+используется только для выбора блоков KV-cache.
+
+#### Какие данные использовались для обучения
+
+Teacher — dense Pythia attention. Для каждого sampled query вычислялась dense
+attention mass по блокам, после чего mass нормировалась и использовалась как
+target распределение важности.
+
+Источником текста был `tinyshakespeare.txt`. Из него формировались циклически
+повторяемые последовательности длиной 2048 токенов:
+
+| Версия | Steps | Sequences | Query stride | Teacher samples | Block size |
+|---|---:|---:|---:|---:|---:|
+| v1 | 500 | 8 | 128 | не зафиксировано | 256 |
+| v2 | 1500 | 32 | 64 | не зафиксировано | 256 |
+| v3 | 1500 | 32 | 64 | не зафиксировано | 256 |
+| v4 | 1500 | 32 | 64 | 2,560 | 256 |
+| v5 | 1500 | 32 | 64 | 3,584 | 16 |
+
+Это не полноценный разнообразный train/validation/test corpus: данные v1–v5
+получены из одного Shakespeare-текста и повторяются циклически. Поэтому
+результаты reranker нельзя считать обобщением на книги, код или технические
+документы.
+
+#### На каких признаках обучался reranker
+
+v1 использовал:
+
+- текущий query-вектор `Q`;
+- одно среднее `K`-представление блока;
+- cosine similarity;
+- признаки `Q`, `K`, `Q*K`, `abs(Q-K)` после low-rank projections.
+
+v3/v4/v5 использовали `MultiScaleKVPositionReranker`:
+
+- текущий query `Q` последнего токена chunk;
+- несколько K-summaries внутри каждого блока;
+- несколько V-summaries внутри каждого блока;
+- mean/max/first/last агрегаты K-представлений;
+- взаимодействия query с K и V;
+- нормированную позицию блока;
+- `log1p` относительной дистанции блока;
+- исходную cosine score как baseline плюс residual neural score.
+
+Для v3/v4 использовалось 4 summary parts на блок. Для v5 использовалось 2
+summary parts при `block_size=16`.
+
+#### Как формировалась objective function
+
+Использовалась комбинация:
+
+    listwise_loss = cross_entropy между dense attention mass и scores reranker
+    ranking_loss = hard-negative margin loss
+    total_loss = listwise_loss + 0.25 * ranking_loss
+
+Hard negative выбирался из блоков с высокой cosine similarity, но с меньшей
+dense attention mass. Это должно было научить reranker исправлять ошибки cosine
+selector, а не просто копировать его.
+
+В v4 был введён `chunk_union` protocol: один route используется для всего
+prefill chunk, поэтому teacher усреднял dense attention mass нескольких query
+внутри chunk. В target попадали только semantic blocks; local/global mandatory
+blocks исключались.
+
+#### Результаты PPL на native context 2048
+
+Dense baseline во всех сравнениях: `PPL=21.52597`.
+
+v4, `block_size=256`:
+
+| Variant | PPL | Δ к dense |
+|---|---:|---:|
+| Full-scan cosine | 21.71604 | +0.19007 |
+| Full-scan v4 reranker | 21.71688 | +0.19091 |
+| Hierarchical v4 reranker | 21.71688 | +0.19091 |
+| Neural full scan v4 | 21.71688 | +0.19091 |
+
+v5, `block_size=16`:
+
+| Variant | PPL | Δ к dense |
+|---|---:|---:|
+| Full-scan cosine | 21.97970 | +0.45373 |
+| Hierarchical cosine | 22.10494 | +0.57897 |
+| Full-scan v5 reranker | 21.92365 | +0.39768 |
+| Hierarchical v5 reranker | 22.09641 | +0.57044 |
+| Neural full scan v5 | 21.93103 | +0.40506 |
+
+Таким образом, v5 улучшил PPL относительно собственного cosine baseline всего
+на `0.05605`, но всё ещё был хуже dense на `1.85%`.
+
+#### Результаты Recall
+
+Recall diagnostic использовал `block_size=16`, 216 samples и oracle Top-16 по
+dense attention mass.
+
+v4:
+
+| Metric | Result |
+|---|---:|
+| Cosine Recall@64 | 93.75% |
+| Hierarchical Recall@64 | 93.75% |
+| Cosine-only Recall@16 | 51.74% |
+| Cosine Top-64 → v4 Top-16 | 35.62% |
+| Neural full-scan v4 Top-16 | 33.88% |
+| Hierarchical Top-64 → v4 Top-16 | 35.62% |
+| Mean reranker latency | 0.769 ms/head |
+
+Для v5 в файле `routing_ablation_v5_b16_2048.json` Recall diagnostic не был
+сохранён; там есть PPL, speed и needle. Поэтому утверждать, что v5 улучшил
+Recall@16, пока нельзя.
+
+#### Результаты speed и needle для v5
+
+На контексте 2048:
+
+| Variant | Prefill tok/s | Decode tok/s | Total s |
+|---|---:|---:|---:|
+| Dense | 24,894 | 84.15 | 0.272 |
+| Full-scan cosine | 1,664 | 32.08 | 1.730 |
+| Full-scan v5 reranker | 1,082 | 23.17 | 2.583 |
+| Hierarchical v5 reranker | 906 | 19.73 | 3.071 |
+
+Относительно v5 cosine reranker увеличил total time на `49.4%`, снизил decode
+throughput с `32.08` до `23.17 tok/s` и увеличил route overhead с `0.067` до
+`0.223 s`.
+
+Needle answer perplexity:
+
+| Variant | Answer PPL | Exact match |
+|---|---:|---:|
+| Dense | 1.63 | нет |
+| Full-scan cosine | 2.63 | нет |
+| Full-scan v5 reranker | 34.81 | нет |
+| Hierarchical v5 reranker | 13.72 | нет |
+
+На этом тесте v5 существенно ухудшил retrieval конкретного факта.
+
+#### Итог эксперимента
+
+Neural reranking технически реализован, обучен на dense teacher и интегрирован
+в full-scan/hierarchical routing. Однако текущие данные не подтверждают его
+практическую пользу:
+
+1. v4 ухудшил diagnostic Recall@16 с `51.74%` до `35.62%`;
+2. v4 не улучшил PPL и добавил latency;
+3. v5 немного улучшил PPL относительно block16 cosine baseline, но потерял
+   почти половину total speed;
+4. v5 ухудшил needle answer PPL с `2.63` до `34.81`;
+5. обучение на одном Tiny Shakespeare не позволяет судить об обобщении.
+
+Текущий production baseline — cosine routing без neural reranking. Neural
+reranker имеет смысл переобучать только после перехода на разнородные данные,
+hold-out validation и in-distribution Recall при том же `block_size`, что и в
+inference. Иначе снижение teacher loss не является доказательством улучшения
+маршрутизации.
+
 ## 9. Что уже работает
 
 - ручная Pythia-1B архитектура на PyTorch;
@@ -434,6 +705,8 @@ budget при фиксированном route, hierarchical router имеет �
 | checkpoints/block-reranker.pt | Старый reranker, 500 steps |
 | checkpoints/block-reranker-v2.pt | Улучшенный старый reranker |
 | checkpoints/block-reranker-v3.pt | Multi-scale K/V/position reranker |
+| checkpoints/block-reranker-v4-chunk-union.pt | Multi-scale reranker с chunk-level dense teacher |
+| checkpoints/block-reranker-v5-b16.pt | Обученный reranker для block_size=16 |
 
 ## 12. Воспроизводимость
 
@@ -455,7 +728,10 @@ Training:
       --reranker-output ./checkpoints/block-reranker-v4.pt \
       --reranker-steps 1500 \
       --reranker-sequences 32 \
-      --reranker-query-stride 64
+      --reranker-query-stride 64 \
+      --teacher-mode chunk_union \
+      --teacher-chunk-size 256 \
+      --teacher-local-window 256
 
 GPU testing выполнялось на двух Tesla V100S-PCIE-32GB. Для честного timing
 нужны warm-up, torch.cuda.synchronize(), одинаковые dtype, prompt,
@@ -478,16 +754,73 @@ new_tokens и очистка cache между моделями.
 
 ### Шаг 2. Сделать teacher targets соответствующими inference
 
-Сейчас при chunk-prefill route строится по query последнего токена chunk, а
-teacher samples в основном описывают одиночный query. Нужно собирать labels
-для всего chunk:
+Ранее при chunk-prefill route строился по query последнего токена chunk, а
+teacher samples описывали одиночный query и включали блоки, которые в runtime
+являются local или global mandatory blocks. Это было несоответствием протокола.
+В `backend/routing_ablation_benchmark.py` теперь добавлен production-aligned
+режим `teacher_mode=chunk_union`:
 
-    Q_chunk -> union/top-k dense-important blocks for all Q in chunk
+- route query — последний query текущего chunk;
+- dense targets — средняя attention mass нескольких query внутри chunk;
+- targets строятся только по complete semantic blocks до local window;
+- local/global mandatory blocks не попадают в выбор reranker;
+- старый `single_query` оставлен как контрольный режим.
+
+Эквивалентно, labels собираются для всего chunk:
+
+    Q_chunk -> normalized dense-important mass over all Q in chunk
 
 Targets следует нормировать по semantic candidate blocks и исключать mandatory
 local/global blocks, которые reranker не выбирает.
 
-### Шаг 3. Обучение на разнообразных данных
+### Шаг 3. Переобучить reranker по исправленному протоколу
+
+Сначала нужен отдельный checkpoint, обученный с `chunk_union`; старые v1/v2/v3
+нельзя считать эквивалентными этому эксперименту:
+
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
+      --mode train-reranker \
+      --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+      --text-file ./tinyshakespeare.txt \
+      --reranker-output ./checkpoints/block-reranker-v4-chunk-union.pt \
+      --reranker-steps 1500 \
+      --reranker-sequences 32 \
+      --reranker-query-stride 64 \
+      --teacher-mode chunk_union \
+      --teacher-chunk-size 256 \
+      --teacher-local-window 256
+
+Сравнение v4 выполнено. На текущем diagnostic v4 не показал роста Recall или
+PPL при измеримой цене reranking latency, поэтому его следует убрать из
+production path до переобучения на production `block_size=256`.
+
+Обучение v4 выполнено успешно:
+
+    steps: 1500
+    teacher samples: 2560
+    final total loss: 0.6474
+    final listwise loss: 0.6474
+    final ranking loss: 0.0
+
+Это доказывает только оптимизацию loss на teacher samples. Это не доказывает
+улучшение PPL, Recall или скорости на отложенном наборе.
+
+Следующее сравнение на GPU:
+
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
+      --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+      --text-file ./tinyshakespeare.txt \
+      --reranker-checkpoint ./checkpoints/block-reranker-v4-chunk-union.pt \
+      --contexts 2048 \
+      --chunk-size 256 \
+      --new-tokens 16 \
+      --output ./routing_ablation_v4_2048.json
+
+Затем повторить ту же команду с `block-reranker-v3.pt` и сравнить JSON-файлы.
+Для speed-only отдельно использовать контексты 14000, 32768 и 100000, поскольку
+PPL за пределами native context 2048 не является честной оценкой качества.
+
+### Шаг 4. Обучение на разнообразных данных
 
 Tiny Shakespeare недостаточен. Добавить:
 
@@ -499,7 +832,7 @@ Tiny Shakespeare недостаточен. Добавить:
 Необходимо хранить train/validation/test split и не полагаться на циклически
 повторяющиеся token IDs.
 
-### Шаг 4. Оптимизация по ranking metrics
+### Шаг 5. Оптимизация по ranking metrics
 
 Измерять и оптимизировать:
 
@@ -514,7 +847,7 @@ Tiny Shakespeare недостаточен. Добавить:
 Hard negatives должны приходить из cosine Top-64: это блоки, которые дешёвый
 selector считает похожими, но dense teacher считает менее важными.
 
-### Шаг 5. Проверка пользы reranker
+### Шаг 6. Проверка пользы reranker
 
 Обязательная таблица:
 
@@ -528,7 +861,7 @@ selector считает похожими, но dense teacher считает ме
 speed. Если reranker не улучшает Recall при приемлемой latency, его следует
 убрать из production path.
 
-### Шаг 6. Runtime optimization
+### Шаг 7. Runtime optimization
 
 Текущие bottleneck’и:
 
@@ -552,7 +885,7 @@ speed. Если reranker не улучшает Recall при приемлемо�
 compiled module: ранее compile добавлял префикс _orig_mod. и ломал strict
 state-dict loading.
 
-### Шаг 7. Long-context adaptation
+### Шаг 8. Long-context adaptation
 
 После стабилизации routing:
 
@@ -565,7 +898,7 @@ state-dict loading.
 Модель, обученная на 2048, не начнёт надёжно понимать 32K только благодаря
 INT4 и routing.
 
-### Шаг 8. Multi-GPU и 1M
+### Шаг 9. Multi-GPU и 1M
 
 Для full INT4 1M cache потребуется изучить:
 
@@ -589,13 +922,16 @@ INT4 и routing.
     Проверен bounded-cache speed-only запуск на 1M токенов.
     На native context routing сохраняет PPL близкий к dense.
     Neural reranker v3 реализован и обучен.
+    Neural reranker v4 обучен на chunk_union teacher protocol.
 
 Научно честный вывод:
 
     INT4 уменьшил memory constant.
     Routing дал bounded selected-attention workload.
     Near-dense PPL подтверждён только около native context.
-    Neural reranker пока не улучшил cosine routing.
+    Для v4 выполнен 16K/32K speed benchmark и diagnostic Recall.
+    Production Recall при block_size=256 пока не доказан.
+    В текущем diagnostic v4 не улучшил cosine routing.
     Hierarchical routing пока проигрывает full scan по wall-clock.
     Long-context quality не доказана.
 
