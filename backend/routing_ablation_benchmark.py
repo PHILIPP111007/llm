@@ -277,7 +277,7 @@ class AblationKVCache(INT4RoutedKVCache):
         return self._node_scores(query_vector, leaf_ids)
 
     def _leaf_summaries(self, block_ids):
-        leaf_ids = self.leaf_start + block_ids
+        leaf_ids = self._cache_index(self.leaf_start + block_ids)
         gather_ids = leaf_ids[:, :, None, None].expand(
             leaf_ids.shape[0],
             leaf_ids.shape[1],
@@ -289,7 +289,7 @@ class AblationKVCache(INT4RoutedKVCache):
         return sums.sum(dim=2) / counts.sum(dim=2).clamp_min(1.0).unsqueeze(-1)
 
     def _leaf_summary_parts(self, block_ids, tree):
-        leaf_ids = self.leaf_start + block_ids
+        leaf_ids = self._cache_index(self.leaf_start + block_ids)
         gather_ids = leaf_ids[:, :, None, None].expand(
             leaf_ids.shape[0],
             leaf_ids.shape[1],

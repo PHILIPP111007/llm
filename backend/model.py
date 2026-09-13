@@ -319,7 +319,17 @@ class INT4FullKVCache:
 
 
 class INT4RoutedKVCache(INT4FullKVCache):
-    """Full INT4 storage with Ocean block routing over the stored tokens."""
+    """Full INT4 storage with selectable indexed block routing.
+
+    ``hierarchical_cosine`` uses the persistent binary summary tree.  At every
+    level it scores only the children of a fixed-width beam, so the number of
+    scored tree nodes is proportional to ``beam_width * log2(num_blocks)``.
+    ``full_scan_cosine`` is retained as the exact ablation baseline and scans
+    every complete block summary.
+
+    The cache still stores every K/V token.  The index changes lookup cost, not
+    storage complexity.
+    """
 
     def __init__(
         self,
@@ -333,6 +343,7 @@ class INT4RoutedKVCache(INT4FullKVCache):
         local_blocks=2,
         local_window=256,
         route_refresh_interval=64,
+        route_mode="hierarchical_cosine",
         device=None,
     ):
         super().__init__(config, max_length=max_length, device=device)
@@ -346,6 +357,11 @@ class INT4RoutedKVCache(INT4FullKVCache):
         self.local_blocks = int(local_blocks)
         self.local_window = int(local_window)
         self.route_refresh_interval = int(route_refresh_interval)
+        self.route_mode = str(route_mode)
+        if self.route_mode not in {"full_scan_cosine", "hierarchical_cosine"}:
+            raise ValueError(
+                "route_mode должен быть full_scan_cosine или hierarchical_cosine"
+            )
         self.part_size = self.block_size // self.summary_parts
         max_blocks = max(1, math.ceil(self.max_length / self.block_size))
         self.tree_capacity = 1
@@ -387,6 +403,10 @@ class INT4RoutedKVCache(INT4FullKVCache):
         self._route_cache = None
         self._route_age = 0
         self._route_num_blocks = -1
+        self.route_calls = 0
+        self.route_nodes_scored = 0
+        self.route_leaf_candidates = 0
+        self.route_depth = int(math.log2(self.tree_capacity))
 
     @torch.no_grad()
     def _commit_current_block(self):
@@ -434,7 +454,23 @@ class INT4RoutedKVCache(INT4FullKVCache):
             self.current_count += take
             offset += take
 
+    def reset_route_stats(self):
+        """Reset routing counters without clearing the KV-cache."""
+        self.route_calls = 0
+        self.route_nodes_scored = 0
+        self.route_leaf_candidates = 0
+
+    def _cache_index(self, index):
+        """Return a Long index on the same device as the cache buffers.
+
+        Routing indices can be produced by notebook helpers or a CPU-side
+        selector.  CUDA gather/index_select requires the index tensor itself
+        to be on the CUDA device, so normalize it at this single boundary.
+        """
+        return index.to(device=self.tree_sums.device, dtype=torch.long)
+
     def _node_scores(self, query_vector, node_ids):
+        node_ids = self._cache_index(node_ids)
         gather_ids = node_ids[:, :, None, None].expand(
             node_ids.shape[0],
             node_ids.shape[1],
@@ -450,11 +486,62 @@ class INT4RoutedKVCache(INT4FullKVCache):
             query_norm * summary_norm
         ).sum(dim=-1).masked_fill(counts <= 0, float("-inf")).max(dim=-1).values
 
+    def _leaf_scores(self, query_vector, block_ids):
+        """Cosine score complete block summaries for each attention head."""
+        leaf_ids = self.leaf_start + block_ids
+        return self._node_scores(query_vector, leaf_ids)
+
     def _aligned_local_start(self, length):
         return max(
             0,
             ((length - self.local_window) // self.block_size) * self.block_size,
         )
+
+    @torch.no_grad()
+    def _hierarchical_candidates(self, query_vector, routeable_blocks, count):
+        """Search the summary tree with fixed beam width.
+
+        For fixed ``beam_width`` and head dimension, each level evaluates a
+        constant number of children.  The number of levels is the tree depth,
+        ``ceil(log2(max_blocks))``.
+        """
+        beam = min(max(self.beam_width, count), routeable_blocks)
+        candidates = torch.zeros(
+            self.num_heads,
+            1,
+            device=self.device,
+            dtype=torch.long,
+        )
+        for _ in range(self.route_depth):
+            left = candidates * 2 + 1
+            right = left + 1
+            children = torch.cat((left, right), dim=-1)
+            self.route_nodes_scored += int(children.numel())
+            keep = min(beam, children.shape[-1])
+            candidates = children.gather(
+                -1,
+                torch.topk(
+                    self._node_scores(query_vector, children),
+                    k=keep,
+                    dim=-1,
+                ).indices,
+            )
+        block_ids = (candidates - self.leaf_start).clamp(0, routeable_blocks - 1)
+        self.route_leaf_candidates += int(block_ids.numel())
+        scores = self._leaf_scores(query_vector, block_ids)
+        self.route_nodes_scored += int(block_ids.numel())
+        return block_ids, scores
+
+    @torch.no_grad()
+    def _full_scan_candidates(self, query_vector, routeable_blocks):
+        all_blocks = torch.arange(
+            routeable_blocks,
+            device=self.device,
+            dtype=torch.long,
+        ).view(1, -1).expand(self.num_heads, -1)
+        self.route_nodes_scored += int(all_blocks.numel())
+        self.route_leaf_candidates += int(all_blocks.numel())
+        return all_blocks, self._leaf_scores(query_vector, all_blocks)
 
     @torch.no_grad()
     def _select_route(self, query, length):
@@ -469,10 +556,18 @@ class INT4RoutedKVCache(INT4FullKVCache):
                 device=self.device,
                 dtype=torch.long,
             )
+
         route_count = min(self.route_blocks, routeable_blocks)
         local_count = min(self.local_blocks, route_count)
-        global_count = min(self.global_blocks, max(0, route_count - local_count))
-        global_ids = torch.arange(global_count, device=self.device, dtype=torch.long)
+        global_count = min(
+            self.global_blocks,
+            max(0, route_count - local_count),
+        )
+        global_ids = torch.arange(
+            global_count,
+            device=self.device,
+            dtype=torch.long,
+        )
         local_ids = torch.arange(
             routeable_blocks - local_count,
             routeable_blocks,
@@ -482,41 +577,40 @@ class INT4RoutedKVCache(INT4FullKVCache):
         mandatory = torch.cat((global_ids, local_ids), dim=0)
         semantic_count = route_count - mandatory.numel()
         if semantic_count <= 0:
+            self.route_calls += 1
             return mandatory.view(1, 1, -1).expand(1, self.num_heads, -1)
+
         query_vector = query[:, :, 0, :].reshape(self.num_heads, self.head_dim)
-        beam = min(max(self.beam_width, route_count), routeable_blocks)
-        candidates = torch.zeros(self.num_heads, 1, device=self.device, dtype=torch.long)
-        for _ in range(int(math.log2(self.tree_capacity))):
-            left = candidates * 2 + 1
-            right = left + 1
-            children = torch.cat((left, right), dim=-1)
-            scores = self._node_scores(query_vector, children)
-            keep = min(beam, children.shape[-1])
-            candidates = children.gather(
-                -1,
-                torch.topk(scores, k=keep, dim=-1).indices,
+        if self.route_mode == "full_scan_cosine":
+            candidate_ids, scores = self._full_scan_candidates(
+                query_vector,
+                routeable_blocks,
             )
-        leaf_ids = (candidates - self.leaf_start).clamp(0, routeable_blocks - 1)
-        mandatory_mask = (
-            leaf_ids.unsqueeze(-1) == mandatory.view(1, 1, -1)
-        ).any(dim=-1)
-        ranks = torch.arange(beam, device=self.device).view(1, -1).expand(
-            self.num_heads,
-            -1,
-        ).masked_fill(mandatory_mask, beam)
-        semantic = leaf_ids.gather(
+        else:
+            candidate_ids, scores = self._hierarchical_candidates(
+                query_vector,
+                routeable_blocks,
+                semantic_count,
+            )
+
+        blocked = (candidate_ids[:, :, None] == mandatory.view(1, 1, -1)).any(dim=-1)
+        scores = scores.masked_fill(blocked, float("-inf"))
+        keep = min(semantic_count, candidate_ids.shape[-1])
+        selected = candidate_ids.gather(
             1,
-            ranks.argsort(dim=-1, stable=True)[:, :semantic_count],
+            torch.topk(scores, k=keep, dim=-1).indices,
         )
+        self.route_calls += 1
         return torch.cat(
-            (
+            [
                 mandatory.view(1, 1, -1).expand(1, self.num_heads, -1),
-                semantic.unsqueeze(0),
-            ),
+                selected.unsqueeze(0),
+            ],
             dim=-1,
         )
 
     def _gather_int4(self, indices, dtype):
+        indices = self._cache_index(indices)
         packed_ids = indices.unsqueeze(-1).expand(-1, -1, -1, self.packed_dim)
         packed_key = self.key_packed.gather(2, packed_ids)
         packed_value = self.value_packed.gather(2, packed_ids)
@@ -561,7 +655,8 @@ class INT4RoutedKVCache(INT4FullKVCache):
         if self._route_cache.shape[-1] == 0:
             return local_key, local_value
         route_ids = (
-            self._route_cache[:, :, :, None] * self.block_size
+            self._cache_index(self._route_cache)[:, :, :, None]
+            * self.block_size
             + self.offsets.view(1, 1, 1, -1)
         ).reshape(1, self.num_heads, -1).clamp_max(length - 1)
         route_key, route_value = self._gather_int4(route_ids, query.dtype)
@@ -637,6 +732,9 @@ class OceanAttention(PythiaAttention):
 
 
 ROUTING_CONFIG = {
+    # Production baseline.  Use HIERARCHICAL_ROUTING_CONFIG below to activate
+    # the indexed O(log N) route search.
+    "route_mode": "full_scan_cosine",
     "block_size": 256,
     "route_blocks": 16,
     "beam_width": 32,
@@ -645,6 +743,11 @@ ROUTING_CONFIG = {
     "local_blocks": 2,
     "local_window": 256,
     "route_refresh_interval": 64,
+}
+
+HIERARCHICAL_ROUTING_CONFIG = {
+    **ROUTING_CONFIG,
+    "route_mode": "hierarchical_cosine",
 }
 
 
@@ -668,6 +771,11 @@ class OceanINT4PythiaForCausalLM(PythiaForCausalLM):
 
     @torch.inference_mode()
     def forward_bounded_chunk(self, input_ids, caches, start_position):
+        input_ids = input_ids.to(
+            device=self.gpt_neox.embed_in.weight.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
         hidden_states = self.gpt_neox.embed_in(input_ids.view(1, -1))
         for layer, cache in zip(self.gpt_neox.layers, caches):
             residual = hidden_states
@@ -691,6 +799,11 @@ class OceanINT4PythiaForCausalLM(PythiaForCausalLM):
 
     @torch.inference_mode()
     def forward_bounded_token(self, input_ids, caches, position):
+        input_ids = input_ids.to(
+            device=self.gpt_neox.embed_in.weight.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
         hidden_states = self.gpt_neox.embed_in(input_ids.view(1, 1))
         for layer, cache in zip(self.gpt_neox.layers, caches):
             residual = hidden_states
