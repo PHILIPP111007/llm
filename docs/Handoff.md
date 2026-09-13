@@ -356,6 +356,67 @@ PPL был примерно 18,757. Это не доказывает, что и�
 Значения зависят от документа и protocol, но вывод устойчив: inference
 optimization не заменяет long-context training.
 
+### 6.9. Native-context PPL при активном hierarchical `log N` cosine routing
+
+После исправления benchmark был повторён с реально активным routing, а не с
+вырожденным режимом, где весь prompt обрабатывается одним chunk и route не
+вызывается. На контексте 2048 сравнивались dense baseline и hierarchical
+cosine routing с `block_size=256`, `beam_width=16`, `route_blocks=16`,
+`local_window=256` и `route_refresh_interval=64`.
+
+| Variant | Mean NLL | PPL | Δ PPL к dense | Δ к dense, % | Tok/s |
+|---|---:|---:|---:|---:|---:|
+| Dense | 3.069260 | 21.525970 | — | — | 10,728 |
+| Hierarchical cosine | 3.078061 | 21.716249 | +0.190279 | +0.88395% | 4,085 |
+
+В hierarchical-режиме routing действительно выполнялся:
+
+| Метрика | Значение |
+|---|---:|
+| Tokens evaluated | 2,047 |
+| Route calls, all layers | 96 |
+| Scored tree nodes, all layers | 7,296 |
+| Mean scored nodes per route | 76 |
+| Routing active | `True` |
+
+Это хороший native-context результат по качеству: PPL отличается от dense менее
+чем на 1%. Одновременно он показывает цену текущего PyTorch-прототипа:
+hierarchical routing дал примерно `2.63x` меньший throughput на этом запуске
+(`4,085` против `10,728` tok/s). Поэтому результат подтверждает качество
+активного `log N` selector, но не заявляет end-to-end ускорение: для этого
+нужны fused kernels, устранение Python overhead и отдельное сравнение полной
+цепочки `prefill + decode`.
+
+### 6.10. End-to-end speed: dense против hierarchical INT4
+
+В файле `end_to_end_speed_results.json` выполнено прямое end-to-end сравнение
+на одинаковых prompt, `chunk_size=1024` и `new_tokens=64`. Dense использовал
+обычный FP16/FP32 KV-cache, а hierarchical-вариант — полный exact INT4
+KV-cache, `block_size=256`, `beam_width=16`, `route_refresh_interval=64` и
+hierarchical cosine routing.
+
+| Контекст | Dense total, s | Hierarchical INT4 total, s | Dense / routed |
+|---:|---:|---:|---:|
+| 2,048 | 0.891 | 1.958 | 0.455x |
+| 14,000 | 3.671 | 3.461 | 1.061x |
+| 32,000 | 10.197 | 5.535 | 1.842x |
+| 100,000 | 57.959 | 14.378 | 4.031x |
+
+Раздельные показатели:
+
+| Контекст | Prefill speedup | Decode speedup |
+|---:|---:|---:|
+| 2,048 | 1.033x | 0.394x |
+| 14,000 | 0.807x | 1.233x |
+| 32,000 | 1.334x | 2.729x |
+| 100,000 | 3.337x | 8.242x |
+
+Таким образом, end-to-end ускорение действительно показано на длинных
+контекстах: `1.84x` на 32K и `4.03x` на 100K. На native context 2K
+hierarchical routing проигрывает из-за постоянного overhead, а на 14K даёт
+только `6.1%` ускорения. Это speed-only benchmark: PPL и retrieval quality на
+32K/100K в этом запуске не измерялись.
+
 ## 7. Controlled routing ablation
 
 Созданы:
@@ -1090,7 +1151,8 @@ INT4 и routing.
     Для v4 выполнен 16K/32K speed benchmark и diagnostic Recall.
     Production Recall при block_size=256 пока не доказан.
     В текущем diagnostic v4 не улучшил cosine routing.
-    Hierarchical routing пока проигрывает full scan по wall-clock.
+    На 2K hierarchical routing проигрывает из-за overhead, но на 32K и 100K
+    end-to-end benchmark показал ускорение 1.84x и 4.03x соответственно.
     Speed на 500K подтверждён, но long-context PPL и retrieval quality не измерены.
     Long-context quality не доказана.
 

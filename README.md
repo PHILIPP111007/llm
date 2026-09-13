@@ -339,6 +339,36 @@ full-scan cosine routing:
 `30.99 GiB`, без весов и временных буферов. Это speed-only benchmark, не
 проверка PPL или retrieval quality.
 
+### End-to-end dense vs hierarchical INT4
+
+Чтобы проверить именно пользовательский сценарий `prefill + генерация`, а не
+только отдельное ядро attention, используется:
+
+```bash
+./.venv/bin/python backend/end_to_end_speed_benchmark.py \
+  --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+  --contexts 2048,14000,32000 \
+  --chunk-size 1024 \
+  --new-tokens 64 \
+  --dense-max-context 14000 \
+  --beam-width 16 \
+  --output end_to_end_speed_results.json
+```
+
+Скрипт подаёт обеим моделям один и тот же токенизированный prompt и использует
+greedy argmax для одинакового числа новых токенов. Dense-модель использует
+обычный FP16/FP32 KV-cache, а наша модель — полный exact INT4 KV-cache и
+hierarchical cosine routing. Считаются отдельно prefill, decode, total и
+отношения `dense_seconds / hierarchical_seconds`.
+
+Модели запускаются последовательно и выгружаются между прогонами, чтобы не
+занимать память GPU двумя копиями Pythia-1B. По умолчанию dense ограничен 14K:
+для 32K он получает явный статус `skipped_dense_guard`, поэтому это не следует
+выдавать за численный speedup — это лишь факт, что routed-вариант завершил
+запуск в пределах выбранного memory/time budget. Для честного численного
+сравнения нужно отдельно запустить dense с повышенным `--dense-max-context`,
+понимая, что его prefill и обычный KV-cache быстро становятся узким местом.
+
 ### Ограничение качества на сверхдлинном контексте
 
 Pythia-1B обучена на 2048 токенах. Тесты на 14K и 32K используют необученную
