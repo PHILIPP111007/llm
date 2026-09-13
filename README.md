@@ -2,7 +2,8 @@
 
 Экспериментальная реализация Pythia-1B на чистом PyTorch находится в
 [`Pythia_1B_routing.ipynb`](./notebooks/Pythia_1B_routing.ipynb). Используются официальные веса Pythia-1B,
-полный packed INT4 KV-cache и hierarchical routing.
+полный packed INT4 KV-cache и production full-scan cosine routing.
+Hierarchical routing реализован как отдельный экспериментальный вариант.
 
 Важно: routing не уменьшает число сохраняемых K/V-токенов. Для каждого токена
 и каждого Transformer-слоя K/V вычисляются и записываются в полный cache. INT4
@@ -27,7 +28,7 @@ flowchart TD
         KV --> IQ["INT4 quantization\nper-token scale"]
         IQ --> Cache["Full INT4 KV-cache\nall tokens, all layers"]
         IQ --> Summary["Incremental block summaries\nsummary_parts=4"]
-        Q --> Route["Hierarchical routing\nbeam_width=32"]
+        Q --> Route["Full-scan cosine routing\nrefresh=64"]
         Summary --> Route
         Route --> Blocks["Select up to 16 blocks\nglobal=1, local=2"]
         Blocks --> Gather["Gather and dequantize\nselected exact K/V"]
@@ -107,7 +108,7 @@ selected attention = O((W + K) · D) = O(1) относительно N
 токена на decode-шаг. Полный KV-cache при этом не сокращается: routing только
 решает, какие блоки читать.
 
-Иерархический refresh маршрута оценивается как:
+Для experimental hierarchical routing refresh маршрута оценивается как:
 
 ```text
 O(beam_width · log(N / block_size) · D)
@@ -123,7 +124,9 @@ decode = O(1) selected attention + O(log N) hierarchical routing
 Между refresh-операциями маршрут переиспользуется, и attention-часть шага
 остаётся `O(1)` относительно `N`. Это не делает всю модель `O(1)`: prefill
 обрабатывает каждый входной токен, проекции и MLP выполняются для каждого
-токена, а полный KV-cache остаётся линейным по памяти.
+токена, а полный KV-cache остаётся линейным по памяти. Production baseline
+использует full-scan cosine, поэтому его routing имеет `O(N / block_size)` на
+каждый refresh, а не `O(log N)`.
 
 ## Память полного cache
 
@@ -159,6 +162,23 @@ paths, поэтому их следует сравнивать только вн
 На этом тесте hierarchical/streaming path сохраняет PPL практически на уровне
 dense baseline. Это не доказывает качество на контекстах, для которых Pythia не
 обучалась.
+
+### Controlled production baseline: cosine routing + full INT4
+
+В контролируемом сравнении на том же Shakespeare-фрагменте production-конфигурация
+с `block_size=256` показала:
+
+| Вариант | Mean NLL | PPL | Δ к dense |
+|---|---:|---:|---:|
+| Dense Pythia | 3.06926 | 21.52597 | — |
+| Full-scan cosine + full INT4 | 3.07805 | 21.71604 | +0.19007 / +0.88% |
+
+Это означает, что sparse routed-модель сохранила near-dense качество на native
+context 2048. Результат подтверждён только на этом датасете и контексте; он не
+является доказательством качества на 14K–1M токенах.
+
+Neural reranking в production baseline не используется: v4 и v5 не дали
+достаточного выигрыша по Recall/PPL и добавили runtime overhead.
 
 Отдельный synthetic needle-контроль для полного INT4-cache на штатном
 контексте дал:
@@ -226,6 +246,25 @@ text exact match  = True
 | 32,768 | 2,881 | 25.0 | 9.04 GiB |
 | 131,072 | 2,486 | 24.7 | 12.46 GiB |
 
+### Финальный speed benchmark production baseline
+
+Отдельный запуск использовал `new_tokens=1000`, полный exact INT4 KV-cache и
+full-scan cosine routing:
+
+| Prompt | Prefill tok/s | Decode tok/s | Total s | Peak allocated |
+|---:|---:|---:|---:|---:|
+| 2,048 | 3,733 | 28.47 | 35.67 | 2.07 GiB |
+| 14,000 | 4,268 | 23.33 | 46.15 | 2.53 GiB |
+| 32,000 | 4,079 | 23.33 | 50.70 | 3.28 GiB |
+| 100,000 | 3,992 | 23.45 | 67.70 | 5.65 GiB |
+| 500,000 | 3,790 | 23.25 | 174.94 | 19.66 GiB |
+
+На контекстах 14K–500K decode throughput оставался в диапазоне
+`23.25–23.45 tok/s`. Полный INT4 cache для 500K оценивался в `15.50 GiB`.
+Контекст 1M был пропущен memory guard: только KV-cache оценивается в
+`30.99 GiB`, без весов и временных буферов. Это speed-only benchmark, не
+проверка PPL или retrieval quality.
+
 ### Ограничение качества на сверхдлинном контексте
 
 Pythia-1B обучена на 2048 токенах. Тесты на 14K и 32K используют необученную
@@ -241,7 +280,7 @@ perplexity        ≈ 18,757
 Текущий результат следует формулировать так:
 
 ```text
-INT4 и hierarchical routing дают инженерную основу для длинного контекста
+INT4 и cosine block routing дают инженерную основу для длинного контекста
 и уменьшают attention workload, но качество на 32K/1M не доказано.
 ```
 
@@ -255,10 +294,11 @@ continued pretraining/fine-tuning на длинных последователь
 Эксперимент остановлен на текущем этапе. Полученный прототип демонстрирует:
 
 1. полное хранение K/V в packed INT4;
-2. hierarchical content-dependent routing;
-3. bounded selected-attention workload при decode;
-4. линейное по контексту потребление памяти полного cache;
-5. возможность проводить speed-only эксперименты на очень длинных входах.
+2. content-dependent full-scan cosine block routing;
+3. hierarchical routing как экспериментальный вариант;
+4. bounded selected-attention workload при decode;
+5. линейное по контексту потребление памяти полного cache;
+6. возможность проводить speed-only эксперименты на очень длинных входах.
 
 Он не демонстрирует гарантированное качество Pythia-1B на 14K, 32K или 1M
 токенах и не должен описываться как законченная long-context модель.
@@ -273,9 +313,10 @@ continued pretraining/fine-tuning на длинных последователь
 | Полный KV-cache | `O(N)` | `O(N)` | Заявлено `O(N)` |
 | INT4 KV-cache | `O(N)` с меньшей константой | `O(N)` с меньшей константой | Детали не раскрыты |
 | Выбранный attention одного decode-токена | `O(N)` | `O((W + K) · D) = O(1)` относительно `N` | Заявлена линейная SSA-архитектура |
-| Hierarchical routing одного decode-токена | — | `O(log N)` на refresh, между refresh — переиспользование route | Заявлена линейная end-to-end селекция |
-| Prefill attention | `O(N²)` | примерно `O(N)` при фиксированном chunk; полный текущий path зависит от routing/index maintenance | Заявлено `O(N)` |
-| Полная обработка контекста | примерно `O(N²)` | примерно `O(N log N)` сейчас | Заявлено `O(N)` |
+| Full-scan cosine routing одного decode-токена | — | `O(N / B)` на refresh | Заявлена линейная end-to-end селекция |
+| Hierarchical routing одного decode-токена | — | `O(log N)` на refresh в теории | Заявлена линейная end-to-end селекция |
+| Prefill attention | `O(N²)` | selected attention ограничен budget, но full-scan routing зависит от числа refresh | Заявлено `O(N)` |
+| Полная обработка контекста | примерно `O(N²)` | не следует считать доказанным `O(N log N)`; зависит от refresh/index maintenance | Заявлено `O(N)` |
 
 Для текущей модели:
 
@@ -342,7 +383,7 @@ attention.
 | TokenSelect | Query-dependent выбор KV-токенов | зависит от selector | sparse read по выбранным токенам | обычно `O(N)` KV | Похожий принцип, но token-level вместо block-level |
 | Native Sparse Attention | Сжатие + fine-grained динамический выбор | sparse/hierarchical | sparse attention | зависит от реализации | Близкая современная trainable-архитектура |
 | SubQ SSA | Content-dependent sparse attention | `O(N)` заявлено | субквадратично по заявлению авторов | `O(N)` заявлено | Наиболее близкий публичный промышленный пример |
-| Текущая модель | Local + semantic blocks + hierarchical routing + INT4 KV | примерно `O(N log N)` в полном текущем path | примерно `O(log N)` на refresh | `O(N)` full INT4 KV | Прозрачный retrofit-прототип Pythia |
+| Текущая модель | Local + semantic blocks + full-scan cosine + INT4 KV | `O(N/B)` на route refresh; полный prefill зависит от refresh | `O(1)` selected attention | `O(N)` full INT4 KV | Прозрачный retrofit-прототип Pythia |
 
 Ссылки на основные работы:
 
