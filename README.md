@@ -166,6 +166,22 @@ Benchmark сохраняет `route_nodes_scored_all_layers`. Это позво�
 время decode. При `new_tokens=16` и `refresh_interval=64` маршрут почти не
 обновляется, поэтому decode-скорость скрывает разницу между алгоритмами.
 
+Для quality-сравнения cosine tree используется отдельный token-by-token PPL
+benchmark:
+
+```bash
+./.venv/bin/python backend/hierarchical_routing_ppl.py \
+  --model-dir /path/to/pythia-snapshot \
+  --context-length 2048 \
+  --beam-widths 8,16,32 \
+  --route-refresh-interval 64 \
+  --output hierarchical_routing_ppl.json
+```
+
+Он сравнивает dense Pythia, full-scan cosine и hierarchical cosine. Для routed
+моделей каждый query получает собственное решение routing; результаты содержат
+PPL относительно dense и число просмотренных index-узлов.
+
 ## Память полного cache
 
 Оценка для Pythia-1B prototype:
