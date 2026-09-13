@@ -738,7 +738,7 @@ reducing measured routing or end-to-end latency. A speedup in the final model
 is not sufficient if the hierarchy merely shifts the cost into summary
 construction, gathers, or Python-side bookkeeping.
 
-### Implemented model pair in `Pythia_1B.ipynb`
+### Implemented model pair in `notebooks/Pythia_1B_routing.ipynb`
 
 The notebook now contains two models built from the same Pythia-1B weights:
 

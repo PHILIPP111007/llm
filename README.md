@@ -1,7 +1,7 @@
 # Исследование каскадной маршрутизации блоков KV-cache для эффективной обработки длинного контекста в GPT-подобной модели
 
 Экспериментальная реализация Pythia-1B на чистом PyTorch находится в
-[`Pythia_1B.ipynb`](./Pythia_1B.ipynb). Используются официальные веса Pythia-1B,
+[`Pythia_1B_routing.ipynb`](./notebooks/Pythia_1B_routing.ipynb). Используются официальные веса Pythia-1B,
 полный packed INT4 KV-cache и hierarchical routing.
 
 Важно: routing не уменьшает число сохраняемых K/V-токенов. Для каждого токена

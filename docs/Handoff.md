@@ -27,7 +27,7 @@ Pythia-1B за пределами обученного контекста 2048 �
 ## 2. Базовая модель
 
 Pythia-1B была реализована вручную на PyTorch. Канонический model-only модуль:
-[model.py](./model.py).
+[model.py](../backend/model.py).
 
 Конфигурация:
 
@@ -244,8 +244,8 @@ optimization не заменяет long-context training.
 ## 7. Controlled routing ablation
 
 Созданы:
-[Pythia_1B_routing.ipynb](./Pythia_1B_routing.ipynb) и
-[routing_ablation_benchmark.py](./routing_ablation_benchmark.py).
+[Pythia_1B_routing.ipynb](../notebooks/Pythia_1B_routing.ipynb) и
+[routing_ablation_benchmark.py](../backend/routing_ablation_benchmark.py).
 
 Сравнивались:
 
@@ -260,8 +260,8 @@ neural_full_scan — learned selector без cosine prefilter.
 
 ### PPL на 2048
 
-Актуальный v3 PPL benchmark находится в
-[routing_ablation_v3_ppl.json](./routing_ablation_v3_ppl.json):
+Актуальный v3 PPL benchmark был сохранён во время последнего GPU-запуска.
+Ключевые значения:
 
 | Variant | PPL | Delta vs dense |
 |---|---:|---:|
@@ -424,13 +424,13 @@ budget при фиксированном route, hierarchical router имеет �
 
 | Файл | Назначение |
 |---|---|
-| [model.py](./model.py) | Каноническая model-only Pythia/Ocean/INT4 реализация |
-| [routing_ablation_benchmark.py](./routing_ablation_benchmark.py) | Обучение reranker и controlled ablation |
-| [Pythia_1B_routing.ipynb](./Pythia_1B_routing.ipynb) | PPL, speed, Recall и needle |
-| [Pythia_1B_INT4_routed_train_benchmark.ipynb](./Pythia_1B_INT4_routed_train_benchmark.ipynb) | Старые INT4 и training эксперименты |
-| [README.md](./README.md) | Краткое описание и таблицы |
+| [model.py](../backend/model.py) | Каноническая model-only Pythia/Ocean/INT4 реализация |
+| [routing_ablation_benchmark.py](../backend/routing_ablation_benchmark.py) | Обучение reranker и controlled ablation |
+| [Pythia_1B_routing.ipynb](../notebooks/Pythia_1B_routing.ipynb) | PPL, speed, Recall и needle |
+| [Pythia_1B_INT4_routed_train_benchmark.ipynb](../notebooks/Pythia_1B_INT4_routed_train_benchmark.ipynb) | Старые INT4 и training эксперименты |
+| [README.md](../README.md) | Краткое описание и таблицы |
 | [sublinear_attention_computation.md](./sublinear_attention_computation.md) | Подробный журнал алгоритма и экспериментов |
-| [tinyshakespeare.txt](./tinyshakespeare.txt) | Локальный benchmark text |
+| [tinyshakespeare.txt](../tinyshakespeare.txt) | Локальный benchmark text |
 | checkpoints/block-reranker.pt | Старый reranker, 500 steps |
 | checkpoints/block-reranker-v2.pt | Улучшенный старый reranker |
 | checkpoints/block-reranker-v3.pt | Multi-scale K/V/position reranker |
@@ -439,7 +439,7 @@ budget при фиксированном route, hierarchical router имеет �
 
 Benchmark:
 
-    ./.venv/bin/python routing_ablation_benchmark.py \
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
       --mode benchmark \
       --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
       --reranker-checkpoint ./checkpoints/block-reranker-v3.pt \
@@ -448,7 +448,7 @@ Benchmark:
 
 Training:
 
-    ./.venv/bin/python routing_ablation_benchmark.py \
+    ./.venv/bin/python backend/routing_ablation_benchmark.py \
       --mode train-reranker \
       --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
       --text-file /home/froschin/work/llm/tinyshakespeare.txt \
