@@ -697,6 +697,7 @@ budget при фиксированном route, hierarchical router имеет �
 |---|---|
 | [model.py](../backend/model.py) | Каноническая model-only Pythia/Ocean/INT4 реализация |
 | [routing_ablation_benchmark.py](../backend/routing_ablation_benchmark.py) | Обучение reranker и controlled ablation |
+| [final_long_context_benchmark.py](../backend/final_long_context_benchmark.py) | Финальный speed benchmark production cosine + full INT4 |
 | [Pythia_1B_routing.ipynb](../notebooks/Pythia_1B_routing.ipynb) | PPL, speed, Recall и needle |
 | [Pythia_1B_INT4_routed_train_benchmark.ipynb](../notebooks/Pythia_1B_INT4_routed_train_benchmark.ipynb) | Старые INT4 и training эксперименты |
 | [README.md](../README.md) | Краткое описание и таблицы |
@@ -707,6 +708,46 @@ budget при фиксированном route, hierarchical router имеет �
 | checkpoints/block-reranker-v3.pt | Multi-scale K/V/position reranker |
 | checkpoints/block-reranker-v4-chunk-union.pt | Multi-scale reranker с chunk-level dense teacher |
 | checkpoints/block-reranker-v5-b16.pt | Обученный reranker для block_size=16 |
+
+Финальный production speed benchmark:
+
+    ./.venv/bin/python backend/final_long_context_benchmark.py \
+      --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+      --text-file ./tinyshakespeare.txt \
+      --contexts 2048,14000,32000,100000,1000000 \
+      --chunk-size 256 \
+      --new-tokens 16 \
+      --max-cache-gib 28 \
+      --output ./final_long_context_cosine_int4.json
+
+Этот тест фиксирует именно production baseline: `block_size=256`,
+`route_blocks=16`, `local_window=256`, `route_refresh_interval=64`, полный
+точный INT4 KV-cache и full-scan cosine routing. Контекст 1M пропускается при
+memory guard, поскольку оценочный cache составляет около 31 GiB без весов и
+временных буферов; это не является успешным запуском 1M.
+
+### Финальный full INT4 benchmark с генерацией 1000 токенов
+
+Обновлённый запуск использовал `new_tokens=1000` и успешно обработал контекст
+до 500,000 токенов:
+
+| Context | Prefill tok/s | Decode tok/s | Total s | Peak allocated |
+|---:|---:|---:|---:|---:|
+| 2,048 | 3,733 | 28.47 | 35.67 | 2.07 GiB |
+| 14,000 | 4,268 | 23.33 | 46.15 | 2.53 GiB |
+| 32,000 | 4,079 | 23.33 | 50.70 | 3.28 GiB |
+| 100,000 | 3,992 | 23.45 | 67.70 | 5.65 GiB |
+| 500,000 | 3,790 | 23.25 | 174.94 | 19.66 GiB |
+
+Для 500K оценочный полный INT4 KV-cache составил `15.50 GiB`; запуск был
+выполнен с полным хранением K/V для каждого входного токена. Decode throughput
+на контекстах 14K–500K оставался в диапазоне `23.25–23.45 tok/s`.
+
+Контекст 1M был пропущен memory guard: оценочный full INT4 KV-cache составляет
+`30.99 GiB` без весов модели и временных буферов. Поэтому 1M-token запуск не
+считался успешным результатом.
+
+Это speed-only benchmark. PPL и retrieval quality на 500K/1M не измерялись.
 
 ## 12. Воспроизводимость
 
@@ -920,6 +961,8 @@ INT4 и routing.
     Routing ограничивает selected-attention workload.
     Local window и hierarchical summaries реализованы.
     Проверен bounded-cache speed-only запуск на 1M токенов.
+    Полный exact INT4 KV-cache проверен на 500K токенах с генерацией 1000 токенов.
+    Полный exact INT4 запуск на 1M не выполнен: memory guard оценил cache в 30.99 GiB.
     На native context routing сохраняет PPL близкий к dense.
     Neural reranker v3 реализован и обучен.
     Neural reranker v4 обучен на chunk_union teacher protocol.
@@ -933,6 +976,7 @@ INT4 и routing.
     Production Recall при block_size=256 пока не доказан.
     В текущем diagnostic v4 не улучшил cosine routing.
     Hierarchical routing пока проигрывает full scan по wall-clock.
+    Speed на 500K подтверждён, но long-context PPL и retrieval quality не измерены.
     Long-context quality не доказана.
 
 Ближайшая цель — исправить protocol: одинаковый block size, chunk-level teacher
