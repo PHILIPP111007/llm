@@ -182,6 +182,26 @@ benchmark:
 моделей каждый query получает собственное решение routing; результаты содержат
 PPL относительно dense и число просмотренных index-узлов.
 
+Для быстрого speed/PPL smoke-test на длинном контексте dense baseline нужно
+пропустить, а routed prefill обработать chunks:
+
+```bash
+./.venv/bin/python backend/hierarchical_routing_ppl.py \
+  --model-dir /path/to/pythia-snapshot \
+  --context-length 32000 \
+  --protocol chunked \
+  --chunk-size 1024 \
+  --skip-dense \
+  --modes hierarchical_cosine \
+  --beam-widths 16 \
+  --output hierarchical_routing_chunked_32k.json
+```
+
+`tokenwise` остаётся строгим quality-протоколом, но имеет линейную стоимость
+полного последовательного decode и поэтому на 32K занимает существенно больше
+времени. `chunked` быстрее, но использует один representative route для
+past-context части chunk и не должен смешиваться с tokenwise PPL в одной таблице.
+
 ## Память полного cache
 
 Оценка для Pythia-1B prototype:

@@ -65,6 +65,33 @@ def parse_args():
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--text-file", default="./tinyshakespeare.txt")
     parser.add_argument("--context-length", type=int, default=2048)
+    parser.add_argument(
+        "--protocol",
+        choices=("tokenwise", "chunked"),
+        default="tokenwise",
+        help="tokenwise — строгий quality path; chunked — быстрый speed path",
+    )
+    parser.add_argument("--chunk-size", type=int, default=256)
+    parser.add_argument(
+        "--modes",
+        default="dense,full_scan_cosine,hierarchical_cosine",
+        help="варианты через запятую; для быстрого tree-теста укажите hierarchical_cosine",
+    )
+    parser.add_argument(
+        "--allow-slow-tokenwise",
+        action="store_true",
+        help="разрешить token-by-token benchmark на контексте выше 2048",
+    )
+    parser.add_argument(
+        "--skip-dense",
+        action="store_true",
+        help="не запускать dense baseline",
+    )
+    parser.add_argument(
+        "--allow-dense-long-context",
+        action="store_true",
+        help="разрешить квадратичный dense baseline выше native context",
+    )
     parser.add_argument("--beam-widths", default="32")
     parser.add_argument("--route-refresh-interval", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=256)
@@ -151,8 +178,20 @@ def evaluate_dense(model, ids):
     }
 
 
+def _route_stats(caches):
+    route_calls = sum(cache.route_calls for cache in caches)
+    nodes_scored = sum(cache.route_nodes_scored for cache in caches)
+    return {
+        "route_calls_all_layers": route_calls,
+        "route_nodes_scored_all_layers": nodes_scored,
+        "mean_nodes_scored_per_route": (
+            nodes_scored / route_calls if route_calls else 0.0
+        ),
+    }
+
+
 @torch.inference_mode()
-def evaluate_routed(model, ids, mode, config):
+def evaluate_routed_tokenwise(model, ids, mode, config):
     model.routing = dict(config)
     device = model.gpt_neox.embed_in.weight.device
     ids = ids.to(device=device, dtype=torch.long, non_blocking=True)
@@ -179,8 +218,54 @@ def evaluate_routed(model, ids, mode, config):
             total_tokens += 1
         synchronize()
         seconds = time.perf_counter() - started
-        route_calls = sum(cache.route_calls for cache in caches)
-        nodes_scored = sum(cache.route_nodes_scored for cache in caches)
+        mean_nll = total_nll / max(total_tokens, 1)
+        route_stats = _route_stats(caches)
+        return {
+            "routing": mode,
+            "tokens": total_tokens,
+            "mean_nll": mean_nll,
+            "perplexity": math.exp(mean_nll),
+            "seconds": seconds,
+            "tokens_per_second": total_tokens / max(seconds, 1e-9),
+            **route_stats,
+            "config": dict(config),
+        }
+    finally:
+        del caches
+
+
+@torch.inference_mode()
+def evaluate_routed_chunked(model, ids, mode, config, chunk_size):
+    device = model.gpt_neox.embed_in.weight.device
+    ids = ids.to(device=device, dtype=torch.long, non_blocking=True)
+    caches = model.new_bounded_cache(int(ids.numel()))
+    total_nll = 0.0
+    total_tokens = 0
+    synchronize()
+    started = time.perf_counter()
+    try:
+        for start in range(0, ids.numel(), chunk_size):
+            end = min(start + chunk_size, ids.numel())
+            logits = model.forward_bounded_chunk(
+                ids[start:end],
+                caches,
+                start,
+            )
+            target = ids[start + 1 : min(end + 1, ids.numel())]
+            if target.numel():
+                total_nll += float(
+                    F.cross_entropy(
+                        logits[:, : target.numel(), :].float().reshape(
+                            -1,
+                            model.config.vocab_size,
+                        ),
+                        target,
+                        reduction="sum",
+                    )
+                )
+                total_tokens += int(target.numel())
+        synchronize()
+        seconds = time.perf_counter() - started
         mean_nll = total_nll / max(total_tokens, 1)
         return {
             "routing": mode,
@@ -189,11 +274,7 @@ def evaluate_routed(model, ids, mode, config):
             "perplexity": math.exp(mean_nll),
             "seconds": seconds,
             "tokens_per_second": total_tokens / max(seconds, 1e-9),
-            "route_calls_all_layers": route_calls,
-            "route_nodes_scored_all_layers": nodes_scored,
-            "mean_nodes_scored_per_route": (
-                nodes_scored / route_calls if route_calls else 0.0
-            ),
+            **_route_stats(caches),
             "config": dict(config),
         }
     finally:
@@ -205,6 +286,28 @@ def main():
     beam_widths = tuple(int(item) for item in args.beam_widths.split(","))
     if any(item <= 0 for item in beam_widths):
         raise ValueError("beam-widths должны быть положительными")
+    modes = tuple(item.strip() for item in args.modes.split(",") if item.strip())
+    allowed_modes = {
+        "dense",
+        "full_scan_cosine",
+        "hierarchical_cosine",
+    }
+    unknown_modes = set(modes) - allowed_modes
+    if not modes or unknown_modes:
+        raise ValueError(
+            f"Неизвестные modes: {sorted(unknown_modes)}; "
+            f"доступны {sorted(allowed_modes)}"
+        )
+    if (
+        args.context_length > PythiaConfig().max_position_embeddings
+        and args.protocol == "tokenwise"
+        and not args.allow_slow_tokenwise
+    ):
+        raise ValueError(
+            "Tokenwise benchmark на контексте выше native слишком медленный. "
+            "Используйте --protocol chunked --skip-dense или явно добавьте "
+            "--allow-slow-tokenwise."
+        )
     model_dir = resolve_model_dir(args)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), use_fast=True)
     text = Path(args.text_file).read_text(encoding="utf-8")
@@ -216,25 +319,48 @@ def main():
     results = {
         "benchmark": "native_context_cosine_tree_ppl",
         "context_length": args.context_length,
-        "protocol": "token_by_token_exact_routed_kv",
+        "protocol": args.protocol,
+        "chunk_size": args.chunk_size,
+        "modes": modes,
         "text_file": str(args.text_file),
         "rows": [],
     }
 
-    dense_model = PythiaForCausalLM(PythiaConfig()).to(
-        device=DEVICE,
-        dtype=DTYPE,
-    ).eval()
-    load_official_weights(dense_model, model_dir)
-    dense_row = evaluate_dense(dense_model, ids)
-    results["dense"] = dense_row
-    results["rows"].append(dense_row)
-    del dense_model
-    clear_gpu_cache()
-    print("--- dense ---")
-    print(dense_row)
+    dense_row = None
+    should_run_dense = (
+        "dense" in modes
+        and not args.skip_dense
+        and (
+            args.allow_dense_long_context
+            or args.context_length <= PythiaConfig().max_position_embeddings
+        )
+    )
+    if should_run_dense:
+        dense_model = PythiaForCausalLM(PythiaConfig()).to(
+            device=DEVICE,
+            dtype=DTYPE,
+        ).eval()
+        load_official_weights(dense_model, model_dir)
+        dense_row = evaluate_dense(dense_model, ids)
+        results["dense"] = dense_row
+        results["rows"].append(dense_row)
+        del dense_model
+        clear_gpu_cache()
+        print("--- dense ---")
+        print(dense_row)
+    else:
+        results["dense"] = {
+            "status": "skipped",
+            "reason": (
+                "context exceeds native context; use "
+                "--allow-dense-long-context to override"
+            ),
+        }
+        print("--- dense skipped ---")
 
     for mode in ("full_scan_cosine", "hierarchical_cosine"):
+        if mode not in modes:
+            continue
         widths = (32,) if mode == "full_scan_cosine" else beam_widths
         for beam_width in widths:
             config = config_for(args, mode, beam_width)
@@ -245,13 +371,28 @@ def main():
                 dtype=DTYPE,
             )
             try:
-                row = evaluate_routed(model, ids, mode, config)
-                row["ppl_delta_vs_dense"] = (
-                    row["perplexity"] - dense_row["perplexity"]
-                )
-                row["ppl_relative_percent_vs_dense"] = 100.0 * (
-                    row["perplexity"] / dense_row["perplexity"] - 1.0
-                )
+                if args.protocol == "tokenwise":
+                    row = evaluate_routed_tokenwise(
+                        model,
+                        ids,
+                        mode,
+                        config,
+                    )
+                else:
+                    row = evaluate_routed_chunked(
+                        model,
+                        ids,
+                        mode,
+                        config,
+                        args.chunk_size,
+                    )
+                if dense_row is not None:
+                    row["ppl_delta_vs_dense"] = (
+                        row["perplexity"] - dense_row["perplexity"]
+                    )
+                    row["ppl_relative_percent_vs_dense"] = 100.0 * (
+                        row["perplexity"] / dense_row["perplexity"] - 1.0
+                    )
                 results["rows"].append(row)
                 print(f"--- {mode}, beam={beam_width} ---")
                 print(row)

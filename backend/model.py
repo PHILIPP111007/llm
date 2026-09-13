@@ -259,7 +259,7 @@ class INT4FullKVCache:
 
     def __init__(self, config, max_length, device=None):
         self.max_length = int(max_length)
-        self.device = device or DEVICE
+        self.device = torch.device(device or DEVICE)
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.packed_dim = (self.head_dim + 1) // 2
@@ -401,12 +401,26 @@ class INT4RoutedKVCache(INT4FullKVCache):
         self.current_block_id = 0
         self.offsets = torch.arange(self.block_size, device=self.device, dtype=torch.long)
         self._route_cache = None
+        self._route_key_cache = None
+        self._route_value_cache = None
         self._route_age = 0
         self._route_num_blocks = -1
         self.route_calls = 0
         self.route_nodes_scored = 0
         self.route_leaf_candidates = 0
         self.route_depth = int(math.log2(self.tree_capacity))
+        self.local_cache_dtype = (
+            torch.float16 if self.device.type == "cuda" else torch.float32
+        )
+        self.local_key_cache = torch.empty(
+            1,
+            self.num_heads,
+            max(1, self.local_window),
+            self.head_dim,
+            device=self.device,
+            dtype=self.local_cache_dtype,
+        )
+        self.local_value_cache = torch.empty_like(self.local_key_cache)
 
     @torch.no_grad()
     def _commit_current_block(self):
@@ -430,6 +444,41 @@ class INT4RoutedKVCache(INT4FullKVCache):
     @torch.no_grad()
     def append_chunk(self, key, value, start_position):
         super().append_chunk(key, value, start_position)
+        if self.local_window > 0 and key.shape[2] > 0:
+            keep_start = max(0, key.shape[2] - self.local_window)
+            keep_positions = torch.arange(
+                start_position + keep_start,
+                start_position + key.shape[2],
+                device=self.device,
+                dtype=torch.long,
+            )
+            packed_key = self.key_packed[
+                :, :, start_position + keep_start : start_position + key.shape[2], :
+            ]
+            packed_value = self.value_packed[
+                :, :, start_position + keep_start : start_position + key.shape[2], :
+            ]
+            key_scale = self.key_scale[
+                :, :, start_position + keep_start : start_position + key.shape[2]
+            ]
+            value_scale = self.value_scale[
+                :, :, start_position + keep_start : start_position + key.shape[2]
+            ]
+            local_key = self._dequantize(
+                packed_key,
+                key_scale,
+                self.head_dim,
+                self.local_cache_dtype,
+            )
+            local_value = self._dequantize(
+                packed_value,
+                value_scale,
+                self.head_dim,
+                self.local_cache_dtype,
+            )
+            ring_positions = keep_positions.remainder(self.local_window)
+            self.local_key_cache.index_copy_(2, ring_positions, local_key)
+            self.local_value_cache.index_copy_(2, ring_positions, local_value)
         offset = 0
         while offset < key.shape[2]:
             position = start_position + offset
@@ -492,10 +541,10 @@ class INT4RoutedKVCache(INT4FullKVCache):
         return self._node_scores(query_vector, leaf_ids)
 
     def _aligned_local_start(self, length):
-        return max(
-            0,
-            ((length - self.local_window) // self.block_size) * self.block_size,
-        )
+        if length <= self.local_window:
+            return 0
+        distance = length - self.local_window
+        return ((distance + self.block_size - 1) // self.block_size) * self.block_size
 
     @torch.no_grad()
     def _hierarchical_candidates(self, query_vector, routeable_blocks, count):
@@ -621,6 +670,32 @@ class INT4RoutedKVCache(INT4FullKVCache):
             self._dequantize(packed_value, value_scale, self.head_dim, dtype),
         )
 
+    def _gather_local(self, indices, dtype):
+        """Read the recent window from the dequantized ring buffer."""
+        if self.local_window <= 0 or indices.shape[-1] == 0:
+            empty = torch.empty(
+                1,
+                self.num_heads,
+                0,
+                self.head_dim,
+                device=self.device,
+                dtype=dtype,
+            )
+            return empty, empty
+        ring_indices = self._cache_index(indices).remainder(self.local_window)
+        gather_ids = ring_indices.unsqueeze(-1).expand(
+            -1,
+            -1,
+            -1,
+            self.head_dim,
+        )
+        key = self.local_key_cache.gather(2, gather_ids)
+        value = self.local_value_cache.gather(2, gather_ids)
+        if key.dtype != dtype:
+            key = key.to(dtype=dtype)
+            value = value.to(dtype=dtype)
+        return key, value
+
     def attention_kv(self, query, position):
         length = position + 1
         if length <= 0:
@@ -640,7 +715,7 @@ class INT4RoutedKVCache(INT4FullKVCache):
             device=self.device,
             dtype=torch.long,
         ).view(1, 1, -1).expand(1, self.num_heads, -1)
-        local_key, local_value = self._gather_int4(local_ids, query.dtype)
+        local_key, local_value = self._gather_local(local_ids, query.dtype)
         num_blocks = length // self.block_size
         if (
             self._route_cache is None
@@ -650,16 +725,28 @@ class INT4RoutedKVCache(INT4FullKVCache):
             self._route_cache = self._select_route(query, length)
             self._route_age = 0
             self._route_num_blocks = num_blocks
+            if self._route_cache.shape[-1] == 0:
+                self._route_key_cache = None
+                self._route_value_cache = None
+            else:
+                route_ids = (
+                    self._cache_index(self._route_cache)[:, :, :, None]
+                    * self.block_size
+                    + self.offsets.view(1, 1, 1, -1)
+                ).reshape(1, self.num_heads, -1).clamp_max(length - 1)
+                self._route_key_cache, self._route_value_cache = self._gather_int4(
+                    route_ids,
+                    query.dtype,
+                )
         else:
             self._route_age += 1
         if self._route_cache.shape[-1] == 0:
             return local_key, local_value
-        route_ids = (
-            self._cache_index(self._route_cache)[:, :, :, None]
-            * self.block_size
-            + self.offsets.view(1, 1, 1, -1)
-        ).reshape(1, self.num_heads, -1).clamp_max(length - 1)
-        route_key, route_value = self._gather_int4(route_ids, query.dtype)
+        route_key = self._route_key_cache
+        route_value = self._route_value_cache
+        if route_key.dtype != query.dtype:
+            route_key = route_key.to(dtype=query.dtype)
+            route_value = route_value.to(dtype=query.dtype)
         return (
             torch.cat((local_key, route_key), dim=2),
             torch.cat((local_value, route_value), dim=2),
