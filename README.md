@@ -82,8 +82,12 @@ full KV-cache memory = O(N)
 
 ### Hierarchical routing
 
-Summary-дерево обновляется инкрементально. Router выбирает блоки по summary,
-после чего из полного INT4-cache извлекаются только выбранные блоки:
+В `backend/model.py` hierarchical routing является отдельным явным режимом
+`route_mode="hierarchical_cosine"`. Summary-дерево обновляется инкрементально:
+при закрытии блока его сумма записывается в leaf и во всех родительских узлах.
+Router спускается по бинарному индексу, оставляя на каждом уровне только
+фиксированный `beam_width` лучших ветвей. Из полного INT4-cache извлекаются
+только выбранные блоки:
 
 ```text
 full INT4 KV-cache
@@ -108,11 +112,15 @@ selected attention = O((W + K) · D) = O(1) относительно N
 токена на decode-шаг. Полный KV-cache при этом не сокращается: routing только
 решает, какие блоки читать.
 
-Для experimental hierarchical routing refresh маршрута оценивается как:
+Для hierarchical routing один refresh маршрута оценивается как:
 
 ```text
-O(beam_width · log(N / block_size) · D)
+O(beam_width · log2(N / block_size) · summary_parts · D)
 ```
+
+Здесь `beam_width`, `summary_parts` и `D` считаются константами конфигурации.
+Обновление индекса при закрытии блока также требует прохода от leaf к корню и
+имеет стоимость `O(log2(N / block_size))` на блок.
 
 Следовательно, context-dependent часть одного decode-шагa имеет оценку:
 
@@ -126,7 +134,21 @@ decode = O(1) selected attention + O(log N) hierarchical routing
 обрабатывает каждый входной токен, проекции и MLP выполняются для каждого
 токена, а полный KV-cache остаётся линейным по памяти. Production baseline
 использует full-scan cosine, поэтому его routing имеет `O(N / block_size)` на
-каждый refresh, а не `O(log N)`.
+каждый refresh, а не `O(log N)`. Для production-сравнения и hierarchical
+режима используется отдельный benchmark:
+
+```bash
+./.venv/bin/python backend/hierarchical_routing_benchmark.py \
+  --model-dir /path/to/pythia-snapshot \
+  --contexts 2048,14000,32000,100000 \
+  --routing both \
+  --output hierarchical_routing_results.json
+```
+
+Benchmark сохраняет `route_nodes_scored_all_layers`. Это позволяет отличить
+настоящий иерархический поиск от полного сканирования: для full-scan число
+проверяемых leaf-summary растёт как `N / block_size`, а для hierarchical при
+фиксированном beam — как `log2(N / block_size)`.
 
 ## Память полного cache
 
