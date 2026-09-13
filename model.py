@@ -1,43 +1,30 @@
-#!/usr/bin/env python3
-"""Train and save Pythia-1B with Ocean sparse routing and full INT4 KV-cache.
+"""Pythia-1B with Ocean routing and full INT4 KV-cache.
 
-The model weights remain FP32/FP16 during training. INT4 is applied to the
-runtime KV-cache used by the inference path; quantizing the cache is not a
-trainable parameter operation.
+This module contains inference architecture only:
 
-Example smoke test:
-    python pythia_ocean_int4_train.py --max-steps 2 --seq-len 8192
+* manual Pythia-1B compatible decoder;
+* RoPE and causal attention;
+* Ocean local/global/semantic block routing;
+* exact full INT4 KV-cache storage;
+* official Hugging Face/safetensors weight loading.
 
-Long-context run:
-    python pythia_ocean_int4_train.py --max-steps 250 --seq-len 8192
-
-The output directory is created as a child folder and contains model_state.pt,
-training_checkpoint.pt, tokenizer files, and run_config.json.
-
-python ./pythia_ocean_int4_train.py \
-  --seq-len 8192 \
-  --max-steps 5000 \
-  --output-dir ./checkpoints/pythia-ocean-int4
+Training, datasets, optimizers and training checkpoints intentionally do not
+belong to this file.  Use ``Pythia_1B_INT4_routed_train_benchmark.ipynb`` or a
+separate training script for those tasks.
 """
 
 from __future__ import annotations
 
-import argparse
 import gc
 import json
 import math
-import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
-from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 
 torch.manual_seed(42)
@@ -653,144 +640,12 @@ ROUTING_CONFIG = {
 }
 
 
-class TrainableOceanAttention(OceanAttention):
-    """Training attention with differentiable selected K/V and detached top-k routing."""
-
-    def __init__(self, config, **routing):
-        super().__init__(config, **routing)
-        self.block_size = int(routing["block_size"])
-        self.local_window = int(routing["local_window"])
-        self.memory_slots = int(routing["route_blocks"])
-        self.summary_parts = int(routing["summary_parts"])
-        self.part_size = self.block_size // self.summary_parts
-        self.global_blocks = int(routing["global_blocks"])
-        self.local_blocks = int(routing["local_blocks"])
-        self.route_refresh_interval = int(routing["route_refresh_interval"])
-
-    @torch.no_grad()
-    def _select_training_blocks(self, query, key, routeable_blocks):
-        if routeable_blocks <= 0 or self.memory_slots <= 0:
-            return torch.empty(1, self.num_attention_heads, 0, device=key.device, dtype=torch.long)
-        route_count = min(self.memory_slots, routeable_blocks)
-        local_count = min(self.local_blocks, route_count)
-        global_count = min(self.global_blocks, max(0, route_count - local_count))
-        mandatory = list(range(global_count))
-        mandatory.extend(range(routeable_blocks - local_count, routeable_blocks))
-        mandatory = list(dict.fromkeys(mandatory))
-        mandatory_ids = torch.tensor(mandatory, device=key.device, dtype=torch.long)
-        semantic_count = route_count - len(mandatory)
-        if semantic_count <= 0:
-            return mandatory_ids.view(1, 1, -1).expand(1, self.num_attention_heads, -1)
-        usable = routeable_blocks * self.block_size
-        block_key = key[:, :, :usable, :].detach()
-        block_key = block_key.view(
-            1,
-            self.num_attention_heads,
-            routeable_blocks,
-            self.summary_parts,
-            self.part_size,
-            self.head_dim,
-        ).mean(dim=4)
-        query_vector = F.normalize(
-            query.detach().mean(dim=2).float(),
-            dim=-1,
-        ).unsqueeze(2).unsqueeze(3)
-        block_norm = F.normalize(block_key.float(), dim=-1)
-        scores = (query_vector * block_norm).sum(dim=-1).amax(dim=-1)
-        blocked = torch.zeros(routeable_blocks, device=key.device, dtype=torch.bool)
-        if mandatory:
-            blocked[mandatory_ids] = True
-        scores = scores.masked_fill(blocked.view(1, 1, -1), float("-inf"))
-        semantic = scores.topk(semantic_count, dim=-1).indices
-        mandatory_part = mandatory_ids.view(1, 1, -1).expand(1, self.num_attention_heads, -1)
-        return torch.cat((mandatory_part, semantic), dim=-1)
-
-    def forward(self, hidden_states, past_key_value=None, use_cache=False):
-        if past_key_value is not None or use_cache:
-            raise NotImplementedError("training path не использует past KV-cache")
-        batch_size, q_len, _ = hidden_states.shape
-        if batch_size != 1:
-            raise NotImplementedError("training path поддерживает batch_size=1")
-        qkv = self.query_key_value(hidden_states)
-        qkv = qkv.view(1, q_len, self.num_attention_heads, 3 * self.head_dim).transpose(1, 2)
-        query, key, value = qkv.chunk(3, dim=-1)
-        positions = torch.arange(q_len, device=hidden_states.device, dtype=torch.long)
-        cos, sin = self.rotary_emb(positions, hidden_states.dtype)
-        query, key = apply_rotary(query, key, cos, sin, self.rotary_ndims)
-        outputs = []
-        for query_start in range(0, q_len, self.route_refresh_interval):
-            query_end = min(query_start + self.route_refresh_interval, q_len)
-            local_start = max(0, query_start - self.local_window)
-            routeable_blocks = local_start // self.block_size
-            route = self._select_training_blocks(
-                query[:, :, query_start : query_start + 1, :],
-                key,
-                routeable_blocks,
-            )
-            local_ids = torch.arange(
-                local_start,
-                query_end,
-                device=hidden_states.device,
-                dtype=torch.long,
-            )
-            local_key = key.index_select(2, local_ids)
-            local_value = value.index_select(2, local_ids)
-            query_positions = torch.arange(
-                query_start,
-                query_end,
-                device=hidden_states.device,
-                dtype=torch.long,
-            )
-            local_allowed = local_ids.view(1, 1, 1, -1) <= query_positions.view(1, 1, -1, 1)
-            if route.shape[-1] > 0:
-                offsets = torch.arange(self.block_size, device=hidden_states.device, dtype=torch.long)
-                route_ids = (
-                    route.unsqueeze(-1) * self.block_size
-                    + offsets.view(1, 1, 1, -1)
-                ).reshape(1, self.num_attention_heads, -1)
-                route_key = key.gather(
-                    2,
-                    route_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim),
-                )
-                route_value = value.gather(
-                    2,
-                    route_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim),
-                )
-                route_allowed = route_ids.unsqueeze(2) <= query_positions.view(1, 1, -1, 1)
-                selected_key = torch.cat((local_key, route_key), dim=2)
-                selected_value = torch.cat((local_value, route_value), dim=2)
-                allowed = torch.cat(
-                    (
-                        local_allowed.expand(1, self.num_attention_heads, -1, -1),
-                        route_allowed,
-                    ),
-                    dim=-1,
-                )
-            else:
-                selected_key = local_key
-                selected_value = local_value
-                allowed = local_allowed.expand(1, self.num_attention_heads, -1, -1)
-            output = F.scaled_dot_product_attention(
-                query[:, :, query_start:query_end, :],
-                selected_key,
-                selected_value,
-                attn_mask=allowed,
-                dropout_p=0.0,
-                is_causal=False,
-            )
-            outputs.append(output)
-        output = torch.cat(outputs, dim=2).transpose(1, 2).contiguous().view(1, q_len, -1)
-        return self.dense(output), None
-
-
 class OceanINT4PythiaForCausalLM(PythiaForCausalLM):
     def __init__(self, config, routing=None):
         super().__init__(config)
         self.routing = dict(routing or ROUTING_CONFIG)
         for layer in self.gpt_neox.layers:
             layer.attention = OceanAttention(config, **self.routing)
-        self.trainable_routing = False
-        self.gradient_checkpointing = False
 
     def new_bounded_cache(self, max_length):
         return [
@@ -848,47 +703,6 @@ class OceanINT4PythiaForCausalLM(PythiaForCausalLM):
                 )
         hidden_states = self.gpt_neox.final_layer_norm(hidden_states)
         return self.embed_out(hidden_states)
-
-    def enable_trainable_routing(self, gradient_checkpointing=True):
-        if not self.trainable_routing:
-            for layer in self.gpt_neox.layers:
-                old_attention = layer.attention
-                new_attention = TrainableOceanAttention(self.config, **self.routing)
-                new_attention.load_state_dict(old_attention.state_dict(), strict=True)
-                reference = next(old_attention.parameters())
-                new_attention.to(
-                    device=reference.device,
-                    dtype=reference.dtype,
-                )
-                layer.attention = new_attention
-            self.trainable_routing = True
-        self.gradient_checkpointing = bool(gradient_checkpointing)
-        return self
-
-    def forward(self, input_ids, past_key_values=None, use_cache=False):
-        if not self.training or not self.trainable_routing:
-            return super().forward(
-                input_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-            )
-        if past_key_values is not None or use_cache:
-            raise NotImplementedError("training path не использует past KV-cache")
-        hidden_states = self.gpt_neox.embed_in(input_ids)
-        for layer in self.gpt_neox.layers:
-            def layer_forward(states, current_layer=layer):
-                output, _ = current_layer(states, past_key_value=None, use_cache=False)
-                return output
-            if self.gradient_checkpointing:
-                hidden_states = activation_checkpoint(
-                    layer_forward,
-                    hidden_states,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states = layer_forward(hidden_states)
-        hidden_states = self.gpt_neox.final_layer_norm(hidden_states)
-        return self.embed_out(hidden_states), None
 
 
 def load_weight_file(path):
@@ -953,280 +767,41 @@ def load_checkpoint(model, checkpoint_path):
     return model
 
 
-def text_stream(
-    tokenizer,
-    dataset_name="emozilla/pg19",
-    split="train",
-    block_size=8192,
-    max_tokens=None,
+def build_ocean_model(
+    config=None,
+    routing=None,
+    device=DEVICE,
+    dtype=DTYPE,
 ):
-    dataset = load_dataset(dataset_name, split=split, streaming=True)
-    buffer = []
-    seen = 0
-    for record in dataset:
-        text = record.get("text", record.get("content", record.get("document", "")))
-        ids = tokenizer(text, add_special_tokens=False).input_ids
-        if max_tokens is not None:
-            remaining = max_tokens - seen
-            if remaining <= 0:
-                break
-            ids = ids[:remaining]
-        buffer.extend(ids)
-        seen += len(ids)
-        while len(buffer) >= block_size:
-            yield torch.tensor(buffer[:block_size], dtype=torch.long)
-            del buffer[:block_size]
-        if max_tokens is not None and seen >= max_tokens:
-            break
-
-
-def save_training_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    output_dir,
-    tokenizer,
-    run_config,
-    completed_steps,
-    completed_optimizer_steps,
-    save_optimizer_state=True,
-):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), output_dir / "model_state.pt")
-    checkpoint = {
-        "model_state": model.state_dict(),
-        "model_config": asdict(model.config),
-        "routing_config": dict(model.routing),
-        "run_config": run_config,
-        "completed_steps": completed_steps,
-        "completed_optimizer_steps": completed_optimizer_steps,
-    }
-    if save_optimizer_state:
-        checkpoint["optimizer_state"] = optimizer.state_dict()
-        checkpoint["scheduler_state"] = scheduler.state_dict()
-    torch.save(checkpoint, output_dir / "training_checkpoint.pt")
-    tokenizer.save_pretrained(output_dir)
-    (output_dir / "run_config.json").write_text(
-        json.dumps(run_config, ensure_ascii=False, indent=2) + "\n"
-    )
-
-
-def train_model(
-    model,
-    tokenizer,
-    output_dir,
-    dataset_name,
-    split,
-    seq_len,
-    max_steps,
-    grad_accum,
-    learning_rate,
-    max_train_tokens,
-    gradient_checkpointing=True,
-    save_optimizer_state=True,
-):
-    model.enable_trainable_routing(gradient_checkpointing=gradient_checkpointing)
-    model = model.to(device=DEVICE).float()
-    model.train()
-    if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
-        raise RuntimeError("В модели уже есть NaN/Inf")
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=0.1,
-    )
-    optimizer_steps = math.ceil(max_steps / grad_accum)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        min(10, optimizer_steps),
-        optimizer_steps,
-    )
-    autocast_dtype = torch.float16 if DEVICE.type == "cuda" else torch.float32
-    use_scaler = DEVICE.type == "cuda" and autocast_dtype == torch.float16
-    scaler = torch.amp.GradScaler(enabled=use_scaler)
-    stream = text_stream(
-        tokenizer,
-        dataset_name=dataset_name,
-        split=split,
-        block_size=seq_len,
-        max_tokens=max_train_tokens,
-    )
-    optimizer.zero_grad(set_to_none=True)
-    optimizer_step = 0
-    loss_ema = None
-    start = time.perf_counter()
-
-    for step in range(max_steps):
-        ids = next(stream).unsqueeze(0).to(DEVICE)
-        with torch.autocast(
-            device_type=DEVICE.type,
-            dtype=autocast_dtype,
-            enabled=DEVICE.type == "cuda",
-        ):
-            logits, _ = model(ids, use_cache=False)
-            loss = F.cross_entropy(
-                logits[:, :-1].float().reshape(-1, model.config.vocab_size),
-                ids[:, 1:].reshape(-1),
-            )
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"NaN/Inf loss at step {step + 1}")
-            scaled_loss = loss / grad_accum
-        (scaler.scale(scaled_loss) if use_scaler else scaled_loss).backward()
-
-        is_update = (step + 1) % grad_accum == 0 or step + 1 == max_steps
-        if is_update:
-            if use_scaler:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if use_scaler:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            optimizer_step += 1
-
-        loss_value = float(loss.detach())
-        loss_ema = loss_value if loss_ema is None else 0.95 * loss_ema + 0.05 * loss_value
-        if (step + 1) % 10 == 0 or step + 1 == max_steps:
-            print(
-                {
-                    "step": step + 1,
-                    "optimizer_step": optimizer_step,
-                    "loss": loss_value,
-                    "loss_ema": loss_ema,
-                    "learning_rate": scheduler.get_last_lr()[0],
-                    "tokens_seen": (step + 1) * seq_len,
-                    "seconds": time.perf_counter() - start,
-                }
-            )
-
-    run_config = {
-        "dataset": dataset_name,
-        "split": split,
-        "sequence_length": seq_len,
-        "max_steps": max_steps,
-        "gradient_accumulation": grad_accum,
-        "learning_rate": learning_rate,
-        "max_train_tokens": max_train_tokens,
-        "gradient_checkpointing": gradient_checkpointing,
-        "trainable_routing": True,
-        "routing": dict(model.routing),
-        "device": str(DEVICE),
-        "training_dtype": "float32 master + float16 autocast" if DEVICE.type == "cuda" else "float32",
-    }
-    save_training_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        output_dir,
-        tokenizer,
-        run_config,
-        max_steps,
-        optimizer_step,
-        save_optimizer_state=save_optimizer_state,
-    )
-    model = model.to(device=DEVICE, dtype=DTYPE).eval()
-    return model
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-id", default="EleutherAI/pythia-1b")
-    parser.add_argument("--model-dir", default=None)
-    parser.add_argument(
-        "--output-dir",
-        default="/home/froschin/work/llm/checkpoints/pythia-1b-ocean-int4-long",
-    )
-    parser.add_argument("--dataset", default="emozilla/pg19")
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--seq-len", type=int, default=8192)
-    parser.add_argument("--max-steps", type=int, default=250)
-    parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=5e-7)
-    parser.add_argument("--max-train-tokens", type=int, default=None)
-    parser.add_argument("--resume", default=None)
-    parser.add_argument("--no-gradient-checkpointing", action="store_true")
-    parser.add_argument("--no-optimizer-checkpoint", action="store_true")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    if args.seq_len < 2:
-        raise ValueError("--seq-len должен быть не меньше 2")
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if args.model_dir is None:
-        model_dir = Path(
-            snapshot_download(
-                repo_id=args.model_id,
-                allow_patterns=[
-                    "config.json",
-                    "tokenizer*",
-                    "*.json",
-                    "*.safetensors",
-                    "*.bin",
-                ],
-            )
-        )
-    else:
-        model_dir = Path(args.model_dir)
-
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), use_fast=True)
+    """Construct the inference-only Ocean Pythia model."""
     model = OceanINT4PythiaForCausalLM(
-        PythiaConfig(),
-        routing=ROUTING_CONFIG,
+        config or PythiaConfig(),
+        routing=routing or ROUTING_CONFIG,
     )
-    model = torch.compile(model=model)
-    if args.resume is not None:
-        print("loading checkpoint:", args.resume)
-        model = load_checkpoint(model, args.resume)
-    else:
-        print("loading official weights:", model_dir)
-        model = load_official_weights(model, model_dir)
-    model = model.to(device=DEVICE, dtype=DTYPE).eval()
+    return model.to(device=device, dtype=dtype).eval()
 
-    max_train_tokens = args.max_train_tokens
-    if max_train_tokens is None:
-        max_train_tokens = args.seq_len * args.max_steps
-    run_config = {
-        "model_id": args.model_id,
-        "model_dir": str(model_dir),
-        "output_dir": str(output_dir),
-        "sequence_length": args.seq_len,
-        "max_steps": args.max_steps,
-        "max_train_tokens": max_train_tokens,
-        "routing": ROUTING_CONFIG,
-        "estimated_int4_kv_gib": (
-            2
-            * model.config.num_hidden_layers
-            * model.config.num_attention_heads
-            * args.seq_len
-            * model.config.head_dim
-            / 2
-            / 2**30
-        ),
-    }
-    print({"device": str(DEVICE), "dtype": str(DTYPE), **run_config})
-    train_model(
-        model=model,
-        tokenizer=tokenizer,
-        output_dir=output_dir,
-        dataset_name=args.dataset,
-        split=args.split,
-        seq_len=args.seq_len,
-        max_steps=args.max_steps,
-        grad_accum=args.grad_accum,
-        learning_rate=args.learning_rate,
-        max_train_tokens=max_train_tokens,
-        gradient_checkpointing=not args.no_gradient_checkpointing,
-        save_optimizer_state=not args.no_optimizer_checkpoint,
+
+def load_ocean_model(
+    model_dir=None,
+    checkpoint_path=None,
+    config=None,
+    routing=None,
+    device=DEVICE,
+    dtype=DTYPE,
+):
+    """Build Ocean and load official or previously saved model weights.
+
+    ``checkpoint_path`` takes precedence over ``model_dir``.  The checkpoint
+    must contain only model parameters; optimizer/training state is not used.
+    """
+    model = build_ocean_model(
+        config=config,
+        routing=routing,
+        device=device,
+        dtype=dtype,
     )
-    print("training complete; saved:", output_dir)
-
-
-if __name__ == "__main__":
-    main()
+    if checkpoint_path is not None:
+        return load_checkpoint(model, checkpoint_path)
+    if model_dir is None:
+        raise ValueError("Укажите model_dir или checkpoint_path")
+    return load_official_weights(model, model_dir)
