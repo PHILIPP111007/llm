@@ -263,7 +263,43 @@ Decode tok/s — скорость генерации новых токенов. 
 retrieval, поэтому конфигурация `beam=8` или `beam=16` не может быть выбрана
 как production-конфигурация только по скорости.
 
-### 6.6. Качество на длинных контекстах
+### 6.6. PPL cosine tree при `block_size=64`
+
+Для проверки влияния beam search был выполнен отдельный token-by-token PPL
+benchmark на контексте 2048 токенов. Использовались один и тот же фрагмент
+Tiny Shakespeare, полный INT4 KV-cache, `route_blocks=16`,
+`summary_parts=4`, `local_window=256` и `route_refresh_interval=64`.
+
+| Routing | Beam width | Mean NLL | PPL | Δ PPL к dense | Δ к dense, % | Tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Dense | — | 3.0693 | 21.5260 | — | — | 10,698 |
+| Full-scan cosine | 32 | 3.1519 | 23.3812 | +1.8553 | +8.62% | 35.68 |
+| Hierarchical cosine | 4 | 3.1750 | 23.9269 | +2.4009 | +11.15% | 34.94 |
+| Hierarchical cosine | 8 | 3.1777 | 23.9919 | +2.4659 | +11.46% | 35.06 |
+| Hierarchical cosine | 16 | 3.1635 | 23.6525 | +2.1265 | +9.88% | 35.11 |
+| Hierarchical cosine | 32 | 3.1499 | 23.3348 | +1.8088 | +8.40% | 35.04 |
+
+Среднее число проверенных index-узлов на один route:
+
+| Routing | Beam width | Узлов на route |
+|---|---:|---:|
+| Full-scan cosine | 32 | 110 |
+| Hierarchical cosine | 4 | 414 |
+| Hierarchical cosine | 8 | 431 |
+| Hierarchical cosine | 16 | 479 |
+| Hierarchical cosine | 32 | 499 |
+
+Результат показывает, что при меньшем beam качество cosine tree ухудшается.
+Только `beam_width=32` приблизился к full-scan: PPL `23.3348` против `23.3812`.
+Однако tree в этом протоколе проверяет примерно в 4–4.5 раза больше index-узлов
+и не даёт практического speedup.
+
+Сравнение с dense нельзя интерпретировать как чистый эффект routing: разница
+включает INT4-квантизацию KV, sparse block selection и ошибку hierarchical
+поиска. Для изоляции этих факторов нужен отдельный full-INT4 контроль с
+полным набором блоков без sparse-ограничения.
+
+### 6.7. Качество на длинных контекстах
 
 Исходная Pythia обучена на context 2048. Поэтому 14K, 32K и 1M тесты нельзя
 считать valid quality benchmarks.
