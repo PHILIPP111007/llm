@@ -187,6 +187,7 @@ def _route_stats(caches):
         "mean_nodes_scored_per_route": (
             nodes_scored / route_calls if route_calls else 0.0
         ),
+        "routing_active": route_calls > 0,
     }
 
 
@@ -297,6 +298,16 @@ def main():
         raise ValueError(
             f"Неизвестные modes: {sorted(unknown_modes)}; "
             f"доступны {sorted(allowed_modes)}"
+        )
+    if (
+        args.protocol == "chunked"
+        and args.context_length <= args.chunk_size
+        and any(mode != "dense" for mode in modes)
+    ):
+        print(
+            "WARNING: chunk_size >= context_length; "
+            "routed past-context не будет активирован. "
+            "Это фактически dense prefill для одного chunk."
         )
     if (
         args.context_length > PythiaConfig().max_position_embeddings
