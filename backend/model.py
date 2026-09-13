@@ -644,7 +644,7 @@ class INT4RoutedKVCache(INT4FullKVCache):
         num_blocks = length // self.block_size
         if (
             self._route_cache is None
-            or self._route_age >= self.route_refresh_interval
+            or self._route_age + 1 >= self.route_refresh_interval
             or self._route_num_blocks != num_blocks
         ):
             self._route_cache = self._select_route(query, length)

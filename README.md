@@ -150,6 +150,22 @@ Benchmark сохраняет `route_nodes_scored_all_layers`. Это позво�
 проверяемых leaf-summary растёт как `N / block_size`, а для hierarchical при
 фиксированном beam — как `log2(N / block_size)`.
 
+Для подбора постоянных факторов hierarchical routing используется sweep:
+
+```bash
+./.venv/bin/python backend/hierarchical_routing_sweep.py \
+  --model-dir /path/to/pythia-snapshot \
+  --contexts 32768,100000 \
+  --beam-widths 8,16,32 \
+  --refresh-intervals 1,4,64 \
+  --new-tokens 64 \
+  --output hierarchical_routing_sweep.json
+```
+
+`new_tokens=64` нужен для того, чтобы измерить стоимость повторного routing во
+время decode. При `new_tokens=16` и `refresh_interval=64` маршрут почти не
+обновляется, поэтому decode-скорость скрывает разницу между алгоритмами.
+
 ## Память полного cache
 
 Оценка для Pythia-1B prototype:
