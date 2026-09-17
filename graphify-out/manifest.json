@@ -1,0 +1,68 @@
+{
+  "backend/end_to_end_speed_benchmark.py": {
+    "mtime": 1789336588.1563284,
+    "seen": 1789663470.5052228,
+    "ast_hash": "18ab21288e92698719e94c722c40f112",
+    "semantic_hash": ""
+  },
+  "backend/final_long_context_benchmark.py": {
+    "mtime": 1789309457.9186237,
+    "seen": 1789663470.5052261,
+    "ast_hash": "baf202586e2cdead46d616bec7f223c5",
+    "semantic_hash": ""
+  },
+  "backend/hierarchical_routing_benchmark.py": {
+    "mtime": 1789313358.3369129,
+    "seen": 1789663470.505228,
+    "ast_hash": "f010eeffb75e0a93a10700c5a1fcb03d",
+    "semantic_hash": ""
+  },
+  "backend/hierarchical_routing_ppl.py": {
+    "mtime": 1789335656.5188086,
+    "seen": 1789663470.5052297,
+    "ast_hash": "3d4f5fd66b9acb1e1c723e5b0db81bc2",
+    "semantic_hash": ""
+  },
+  "backend/hierarchical_routing_sweep.py": {
+    "mtime": 1789313684.4443796,
+    "seen": 1789663470.5052314,
+    "ast_hash": "25b551a3dd349c67afde3e093426a1f3",
+    "semantic_hash": ""
+  },
+  "backend/model.py": {
+    "mtime": 1789317959.8772073,
+    "seen": 1789663470.5052328,
+    "ast_hash": "bebc9e45be803f30b8d6a72b47c08493",
+    "semantic_hash": ""
+  },
+  "backend/routing_ablation_benchmark.py": {
+    "mtime": 1789313281.7681055,
+    "seen": 1789663470.5052347,
+    "ast_hash": "e1ee1e67e92567243773d41ea0bcd951",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1789336263.109015,
+    "seen": 1789663470.5052361,
+    "ast_hash": "c4eed893f43d3e68ba94390feb40806a",
+    "semantic_hash": ""
+  },
+  "docs/Handoff.md": {
+    "mtime": 1789337048.9370196,
+    "seen": 1789663470.5052378,
+    "ast_hash": "c07fd618088dfc98a248b742d8ee44ae",
+    "semantic_hash": ""
+  },
+  "docs/sublinear_attention_computation.md": {
+    "mtime": 1789305890.5368457,
+    "seen": 1789663470.5052392,
+    "ast_hash": "8e4fb313fcb1986bd9b02c65aad9fbcf",
+    "semantic_hash": ""
+  },
+  "requirements.txt": {
+    "mtime": 1789663438.7942972,
+    "seen": 1789663470.5052407,
+    "ast_hash": "fc9d97222313445b2351327241c3ee01",
+    "semantic_hash": ""
+  }
+}

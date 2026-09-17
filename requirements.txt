@@ -13,3 +13,4 @@ datasets
 matplotlib
 tqdm
 ipykernel
+graphifyy

@@ -1,0 +1,12 @@
+{
+  "0": "model.py",
+  "1": "Исследование каскадной маршрутизации блоков KV-cache для эффективной обработки длинного контекста в GPT-подобной модели",
+  "2": "routing_ablation_benchmark.py",
+  "3": "INT4RoutedKVCache",
+  "4": "Handoff: Pythia-1B Ocean / sublinear attention",
+  "5": ".__init__",
+  "6": "Измеренные результаты",
+  "7": "MultiScaleKVPositionReranker",
+  "8": "6. История ключевых экспериментов",
+  "9": "AblationKVCache"
+}
