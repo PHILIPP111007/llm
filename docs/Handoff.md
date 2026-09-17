@@ -417,6 +417,78 @@ hierarchical routing проигрывает из-за постоянного ove
 только `6.1%` ускорения. Это speed-only benchmark: PPL и retrieval quality на
 32K/100K в этом запуске не измерялись.
 
+### 6.11. Sweep размера блока на native context 2048
+
+Выполнен benchmark `block_size_sweep_2048.json` с активным hierarchical
+cosine routing. Использовались `context_length=2048`, `chunk_size=256`,
+`route_blocks=16`, `beam_width=16`, `summary_parts=4`, `local_window=256` и
+`route_refresh_interval=64`. Dense baseline измерялся на том же prompt.
+
+| Block size | PPL | Δ PPL к dense | Δ к dense, % | Throughput, tok/s |
+|---:|---:|---:|---:|---:|
+| Dense | 21.5260 | — | — | 5,552 |
+| 16 | 22.2849 | +0.7590 | +3.53% | 976 |
+| 32 | 22.3163 | +0.7903 | +3.67% | 1,763 |
+| 64 | 21.8502 | +0.3242 | +1.51% | 2,692 |
+| 128 | 21.7996 | +0.2736 | +1.27% | 3,436 |
+| 256 | 21.7162 | +0.1903 | +0.88% | 4,673 |
+
+Routing был активен во всех routed-запусках: `96` route calls по всем слоям.
+При уменьшении блока среднее число просмотренных tree nodes на route выросло
+с `76` для `block_size=256` до `1,136` для `block_size=16`.
+
+Результат объясняется фиксированным `route_blocks=16`: меньший блок означает
+меньший бюджет выбранных токенов — примерно 256 semantic-токенов при
+`block_size=16` против 4,096 при `block_size=256` до ограничения длиной
+контекста. Поэтому малые блоки одновременно теряют больше контекста и требуют
+более глубокого/дорогого tree search. В этой конфигурации лучший вариант —
+`block_size=256`; сравнение малых блоков требует отдельного эксперимента с
+одинаковым бюджетом выбранных токенов.
+
+### 6.12. Equal semantic-token budget при `context=2048`
+
+Чтобы отделить влияние размера блока от простого изменения числа выбранных
+токенов, выполнен sweep `equal_token_budget_sweep_2048.json`. Nominal semantic
+budget был зафиксирован на `1024` токена, поэтому использовались пары:
+
+    block_size=16  -> route_blocks=64
+    block_size=32  -> route_blocks=32
+    block_size=64  -> route_blocks=16
+    block_size=128 -> route_blocks=8
+    block_size=256 -> route_blocks=4
+
+Другие параметры: `chunk_size=256`, `beam_width=16`, `summary_parts=4`,
+`local_window=256`, `global_blocks=1`, `local_blocks=2` и
+`route_refresh_interval=64`.
+
+| Block size | Route blocks | PPL | Δ PPL к dense | Δ к dense, % | Throughput, tok/s |
+|---:|---:|---:|---:|---:|---:|
+| Dense | — | 21.5260 | — | — | 9,945 |
+| 16 | 64 | 22.1686 | +0.6426 | +2.99% | 1,075 |
+| 32 | 32 | 22.1949 | +0.6689 | +3.11% | 1,864 |
+| 64 | 16 | 21.8502 | +0.3242 | +1.51% | 2,531 |
+| 128 | 8 | 21.7402 | +0.2142 | +1.00% | 3,580 |
+| 256 | 4 | 21.7666 | +0.2406 | +1.12% | 5,125 |
+
+Routing был активен во всех случаях: `96` route calls по всем слоям. Несмотря
+на одинаковый nominal token budget, стоимость hierarchical search резко
+возросла на малых блоках:
+
+| Block size | Mean scored tree nodes per route |
+|---:|---:|
+| 16 | 2,049 |
+| 32 | 1,003 |
+| 64 | 517 |
+| 128 | 237 |
+| 256 | 76 |
+
+Гипотеза о том, что одинаковый token budget автоматически сделает малые блоки
+выгоднее, не подтвердилась. Лучший PPL дал `block_size=128` (`21.7402`), но
+самый быстрый routed-вариант — `block_size=256` (`5,125 tok/s`). Для текущей
+PyTorch-реализации практический диапазон находится между `128` и `256`:
+малые блоки требуют более глубокого и дорогого tree search и не дают
+компенсирующего улучшения качества.
+
 ## 7. Controlled routing ablation
 
 Созданы:

@@ -202,6 +202,42 @@ PPL относительно dense и число просмотренных inde
 времени. `chunked` быстрее, но использует один representative route для
 past-context части chunk и не должен смешиваться с tokenwise PPL в одной таблице.
 
+Для sweep меньших блоков на native context 2048 используется отдельный скрипт:
+
+```bash
+./.venv/bin/python backend/block_size_sweep_2048.py \
+  --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+  --context-length 2048 \
+  --protocol chunked \
+  --chunk-size 256 \
+  --block-sizes 16,32,64,128,256 \
+  --beam-width 16 \
+  --route-refresh-interval 64 \
+  --output block_size_sweep_2048.json
+```
+
+Скрипт один раз измеряет dense baseline, затем последовательно проверяет
+hierarchical cosine routing. Для каждого `block_size` сохраняются PPL, delta к
+dense, throughput, число route calls и число просмотренных tree nodes.
+
+Для честного сравнения при одинаковом бюджете выбранных semantic-токенов:
+
+```bash
+./.venv/bin/python backend/equal_token_budget_sweep_2048.py \
+  --model-dir /home/froschin/.cache/huggingface/hub/models--EleutherAI--pythia-1b/snapshots/f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2 \
+  --context-length 2048 \
+  --protocol chunked \
+  --chunk-size 256 \
+  --block-sizes 16,32,64,128,256 \
+  --token-budget 1024 \
+  --beam-width 16 \
+  --route-refresh-interval 64 \
+  --output equal_token_budget_sweep_2048.json
+```
+
+При `token-budget=1024` скрипт использует `route_blocks=64,32,16,8,4`
+соответственно для размеров блоков `16,32,64,128,256`.
+
 ## Память полного cache
 
 Оценка для Pythia-1B prototype:
